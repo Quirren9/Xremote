@@ -90,6 +90,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     val cameraName = MutableStateFlow("")
     /** Save every JPEG the camera takes to Pictures/X Remote. */
     val autoSave = MutableStateFlow(true)
+    private val _lastShot = MutableStateFlow<ImageBitmap?>(null)
+    /** Preview of the most recent shot, shown as a thumbnail. */
+    val lastShot = _lastShot.asStateFlow()
     /** Short transfer status for the status bar, null when idle. */
     val transfer = MutableStateFlow<String?>(null)
     private val seenHandles = HashSet<Long>()
@@ -240,11 +243,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             while (isActive) {
                 delay(1000)
                 val now = System.nanoTime()
-                val stalled = lastFrameNs != 0L && now - lastFrameNs > 3_000_000_000L
-                if (stalled && transfer.value == null && now - lastRestart > 6_000_000_000L) {
+                val stalled = lastFrameNs != 0L && now - lastFrameNs > 4_000_000_000L
+                if (stalled && transfer.value == null && !cam.inGallery && now - lastRestart > 8_000_000_000L) {
                     lastRestart = now
-                    logger.log("Live view stalled, restarting it")
-                    runCatching { withContext(camIo) { cam.restartLiveView() } }
+                    logger.log("Live view stalled, switching camera back to live view")
+                    runCatching { withContext(camIo) { cam.enterLiveView() } }
                 }
             }
         }
@@ -258,37 +261,42 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val params = (8 until body.size - 3 step 4).map { body.u32(it) }
         logger.log("Camera event ${hex16(event)} params ${params.joinToString { hexL(it) }}")
         val cam = camera ?: return
-        // 0xC001 after a shot: (handle, handle, size). 0xC004 comes first and only announces it.
+        // 0xC004 = ObjectAdded (photo written), 0xC001 = PreviewAvailable (comes ~0.5 s later)
         if (event != 0xC001 || params.isEmpty()) return
-        val handle = params[0]
-        val size = params.getOrElse(2) { 0L }
-        if (!seenHandles.add(handle)) return
+        if (!seenHandles.add(params[0])) return
         viewModelScope.launch {
-            runCatching { fetchAndSave(cam, handle, size) }.onFailure { logger.log("Transfer of ${hexL(handle)} failed: ${it.message}") }
+            runCatching { afterShot(cam) }.onFailure { logger.log("After-shot handling failed: ${it.message}") }
         }
     }
 
-    private suspend fun fetchAndSave(cam: FujiCamera, handle: Long, size: Long) {
-        transfer.value = if (autoSave.value) "Saving" else null
+    private suspend fun afterShot(cam: FujiCamera) {
+        transfer.value = "Preview"
         try {
+            withContext(camIo) {
+                cam.capturePreview()?.let { jpeg ->
+                    BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.let { _lastShot.value = it.asImageBitmap() }
+                }
+            }
             if (autoSave.value) {
-                val shot = withContext(camIo) { cam.fetchShot(handle, size) }
+                transfer.value = "Saving"
+                val shot = withContext(camIo) {
+                    cam.enterGallery()
+                    cam.fetchNewestJpeg { f -> transfer.value = "Saving ${(f * 100).toInt()}%" }
+                }
                 if (shot == null) {
-                    logger.log("Could not get the image from the camera (see attempts above)")
-                    _toast.tryEmit("Couldn't copy the photo yet, the log shows why")
+                    logger.log("Could not copy the photo (see the lines above)")
+                    _toast.tryEmit("Couldn't copy the photo, the log shows why")
                 } else {
-                    val (fileName, bytes, method) = shot
-                    val name = fileName?.takeIf { it.isNotBlank() } ?: "XT3_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.JPG"
+                    val (name, bytes, method) = shot
                     withContext(Dispatchers.IO) { saveToGallery(name, bytes) }
-                    logger.log("Saved $name (${bytes.size / 1024} KB, via $method) to Pictures/X Remote")
+                    logger.log("Saved $name (${bytes.size / 1024} KB, $method) to Pictures/X Remote")
                     _toast.tryEmit("Saved $name")
                 }
             }
         } finally {
             transfer.value = null
+            runCatching { withContext(camIo) { cam.enterLiveView() } }.onFailure { logger.log("Back to live view failed: ${it.message}") }
         }
-        // Bring live view back: the camera keeps it off after a shot until the capture session is reopened
-        runCatching { withContext(camIo) { cam.restartLiveView() } }.onFailure { logger.log("Live view restart failed: ${it.message}") }
     }
 
     private fun saveToGallery(name: String, bytes: ByteArray) {

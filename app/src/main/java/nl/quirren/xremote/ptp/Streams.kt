@@ -35,7 +35,7 @@ class LiveViewStream(
                 val s = socketFactory.createSocket()
                 s.tcpNoDelay = true
                 s.connect(InetSocketAddress(host, port), 5000)
-                s.soTimeout = 10000
+                s.soTimeout = 120000   // the camera pauses the stream after shots; don't drop the socket
                 s.receiveBufferSize = 512 * 1024
                 socket = s
                 log.log("Live view connected on :$port")

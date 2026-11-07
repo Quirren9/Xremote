@@ -59,6 +59,7 @@ changed = {}
 lock = threading.Lock()
 event_socks = []
 PHOTOS = {}   # handle -> (filename, jpeg bytes)
+STATE = {'client': 5}
 
 def make_photo():
     try:
@@ -136,7 +137,8 @@ def run(code, params, data):
         if code == 0x1014:
             return (OK, PROPS[p0].desc()) if p0 in PROPS else (PROP_NOT_SUPPORTED, None)
         if code == 0x1015:
-            if p0 == 0xD212:
+            if p0 == 0xD212:   # like the X-T3: a snapshot that includes the object count
+                changed[0xD222] = len(PHOTOS)
                 items = list(changed.items()); changed.clear()
                 return OK, struct.pack("<H", len(items)) + b"".join(struct.pack("<HI", c, v & 0xFFFFFFFF) for c, v in items)
             if p0 == 0xDF24: return OK, struct.pack("<I", 0x00020005)
@@ -144,7 +146,8 @@ def run(code, params, data):
             if p0 in PROPS: p = PROPS[p0]; return OK, struct.pack(FMT[p.typ], p.value)
             return PROP_NOT_SUPPORTED, None
         if code == 0x1016:
-            if p0 in (0xDF01, 0xDF24, 0xD208): return OK, None
+            if p0 == 0xDF01: STATE['client'] = struct.unpack('<H', data[:2])[0]; return OK, None
+            if p0 in (0xDF00, 0xDF24, 0xDF25, 0xD208): return OK, None
             p = PROPS.get(p0)
             if not p: return PROP_NOT_SUPPORTED, None
             if not p.writable: return 0x200E, None  # AccessDenied (dial not on A)
@@ -156,13 +159,15 @@ def run(code, params, data):
             h = 0x220 + 6 * len(PHOTOS); PHOTOS[h] = (f"DSCF{1000 + len(PHOTOS):04d}.JPG", make_photo())
             threading.Timer(0.5, lambda: (send_event(0xC004, h - 6, h - 6), send_event(0xC001, h, h, 0x64a8))).start()
             print(f"[ctl] *click* -> handle {h:#x}"); return OK, None
-        if code == 0x1008:   # like the X-T3 in remote mode: the announced handle is rejected
-            return 0x2009, None
-        if code == 0x1009:   # assumption to test the fallback chain: GetObject on the handle works
-            return (OK, PHOTOS[p0][1]) if p0 in PHOTOS else (0x2009, None)
+        if code == 0x9022:   # GetCapturePreview
+            return (OK, make_photo()) if PHOTOS else (0x2009, None)
+        gallery = list(PHOTOS)[::-1]   # newest first, numbered 1..N in gallery mode
+        if code == 0x1008:
+            if STATE['client'] != 11 or not 1 <= p0 <= len(gallery): return 0x2009, None
+            return OK, object_info(gallery[p0 - 1])
         if code == 0x101B:
-            if p0 not in PHOTOS: return 0x2009, None
-            data = PHOTOS[p0][1]; off, n = params[1], params[2]; return OK, data[off:off + n]
+            if STATE['client'] != 11 or not 1 <= p0 <= len(gallery): return 0x2009, None
+            data = PHOTOS[gallery[p0 - 1]][1]; off, n = params[1], params[2]; return OK, data[off:off + n]
     return NOT_SUPPORTED, None
 
 def frames():

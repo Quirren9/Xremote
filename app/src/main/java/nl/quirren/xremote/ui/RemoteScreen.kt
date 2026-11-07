@@ -86,6 +86,7 @@ fun RemoteScreen(vm: RemoteViewModel, onShowLog: () -> Unit) {
     val name by vm.cameraName.collectAsStateWithLifecycle()
     val autoSave by vm.autoSave.collectAsStateWithLifecycle()
     val transfer by vm.transfer.collectAsStateWithLifecycle()
+    val lastShot by vm.lastShot.collectAsStateWithLifecycle()
     var selected by remember { mutableStateOf<Int?>(null) }
 
     Row(Modifier.fillMaxSize().background(Bg).safeDrawingPadding()) {
@@ -98,6 +99,11 @@ fun RemoteScreen(vm: RemoteViewModel, onShowLog: () -> Unit) {
         Box(Modifier.weight(1f).fillMaxHeight()) {
             LiveView(frame, focus, onTap = vm::tapFocus, modifier = Modifier.fillMaxSize())
             StatusBar(name, props, fps, transfer, Modifier.align(Alignment.TopCenter).padding(8.dp))
+            lastShot?.let { shot ->
+                Image(bitmap = shot, contentDescription = "Last shot", contentScale = ContentScale.Crop,
+                    modifier = Modifier.align(Alignment.TopEnd).padding(10.dp).size(width = 96.dp, height = 64.dp)
+                        .clip(RoundedCornerShape(6.dp)).border(1.dp, TextHi, RoundedCornerShape(6.dp)))
+            }
             val sel = selected?.let { c -> props.find { it.code == c } }
             if (sel != null) {
                 ValuePicker(

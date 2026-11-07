@@ -30,7 +30,12 @@ class FujiCamera(
     fun connect(clientName: String) {
         client.connect(host, PORT_CONTROL, clientName)
 
-        expectOk(client.transaction(PtpOp.OPEN_SESSION, listOf(1)), "OpenSession", allow = setOf(0x201E))
+        val open = client.transaction(PtpOp.OPEN_SESSION, listOf(1))
+        if (open.code == 0x201E) {   // left over from an app that didn't disconnect cleanly
+            log.log("Old session still open on the camera, closing it first")
+            client.transaction(PtpOp.CLOSE_SESSION)
+            expectOk(client.transaction(PtpOp.OPEN_SESSION, listOf(1)), "OpenSession")
+        } else expectOk(open, "OpenSession")
 
         // Tell the camera we are a remote-shooting client.
         if (!setRaw(FujiProp.CLIENT_STATE, REMOTE_MODE, 2) && !setRaw(FujiProp.CLIENT_STATE, REMOTE_MODE, 4)) {
@@ -43,6 +48,7 @@ class FujiCamera(
         val version = if (ver.ok && ver.data != null && ver.data.size >= 4) ver.data.u32(0) else 0x00020005L
         log.log("Remote version ${hexL(version)}")
         setRaw(FujiProp.REMOTE_VERSION, version, 4)
+        remoteVersion = version
 
         try {
             val info = client.transaction(PtpOp.GET_DEVICE_INFO)
@@ -168,6 +174,8 @@ class FujiCamera(
         val out = HashMap<Int, Long>()
         val rd = LeReader(d, 2)
         repeat(n) { out[rd.u16()] = rd.u32() }
+        out[FujiProp.OBJECT_COUNT]?.let { numObjects = it.toInt() }
+        out[FujiProp.CAMERA_STATE]?.let { cameraState = it.toInt() }
         return out
     }
 
@@ -209,7 +217,7 @@ class FujiCamera(
 
     /** Downloads an object in 512 KB chunks (falls back to a single GetObject). */
     fun download(info: ObjectInfo, progress: (Float) -> Unit): ByteArray? {
-        val chunk = 512L * 1024
+        val chunk = 1024L * 1024
         val out = java.io.ByteArrayOutputStream(info.size.toInt().coerceAtLeast(0))
         var off = 0L
         while (info.size > 0 && off < info.size) {
@@ -242,11 +250,44 @@ class FujiCamera(
         }
     }
 
-    /** Full live view restart: close the capture session, reopen it, reconnect the stream. */
-    fun restartLiveView() {
-        terminateCapture()
+    var remoteVersion = 0x00020007L; private set
+    @Volatile var numObjects = -1; private set
+    @Volatile var cameraState = -1; private set
+    @Volatile var inGallery = false; private set
+
+    private fun events() { try { pollChanges() } catch (e: java.net.SocketTimeoutException) { log.log("  events timed out") } }
+
+    /**
+     * Remote image view ("gallery") mode, as the official app and libfuji do it. Only in this state does the
+     * camera allow object access; photos are then numbered 1..N (N from property 0xD222).
+     */
+    fun enterGallery() {
+        log.log("Switching camera to gallery mode")
+        events()
+        setRaw(FujiProp.CAMERA_STATE, 6, 2)          // FUJI_REMOTE_ACCESS
+        events(); events()
+        setRaw(FujiProp.CLIENT_STATE, 11, 2)         // FUJI_MODE_REMOTE_IMG_VIEW
+        events()
+        val v = client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(FujiProp.REMOTE_GET_OBJECT_VERSION.toLong()))
+        log.log("  RemoteGetObjectVersion: ${v.data?.let { if (it.size >= 4) hexL(it.u32(0)) else it.hex() } ?: PtpResp.name(v.code)}")
+        setRaw(FujiProp.REMOTE_GET_OBJECT_VERSION, 5, 4)
+        events()
+        inGallery = true
+        log.log("  camera state $cameraState, $numObjects objects on card")
+    }
+
+    /** Back to remote live view on the already open sockets; the stream resumes by itself. */
+    fun enterLiveView() {
+        log.log("Switching camera back to live view")
+        setRaw(FujiProp.CAMERA_STATE, 6, 2)
+        events()
+        setRaw(FujiProp.CLIENT_STATE, REMOTE_MODE, 2)
+        client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(FujiProp.REMOTE_VERSION.toLong()))
+        setRaw(FujiProp.REMOTE_VERSION, remoteVersion, 4)
+        events()
         startRemote()
-        reconnectLiveView()
+        events()
+        inGallery = false
     }
 
     private fun jpegStart(d: ByteArray?): Int {
@@ -262,36 +303,27 @@ class FujiCamera(
         return if (r.ok && d != null && at >= 0) d.copyOfRange(at, d.size) else null
     }
 
+    /** The quick post-shot preview the camera offers with event 0xC001. */
+    fun capturePreview(): ByteArray? = try {
+        tryJpeg("GetCapturePreview", client.transaction(PtpOp.FUJI_GET_CAPTURE_PREVIEW, timeoutMs = 8000))
+    } catch (e: java.net.SocketTimeoutException) { log.log("  GetCapturePreview timed out"); null }
+
+    private fun dscfNumber(name: String) = Regex("(\\d{3,})").findAll(name).lastOrNull()?.value?.toLongOrNull() ?: -1
+
     /**
-     * After a shot the X-T3 announces (handle, size) but rejects GetObjectInfo on it in remote mode.
-     * Tries the plausible ways to get the image, in order, logging each, and returns the first JPEG.
-     * Returns (file name or null, bytes, method).
+     * Downloads the newest JPEG on the card. Must be called in gallery mode. Checks both ends of the list,
+     * since some bodies sort newest first and others oldest first.
      */
-    fun fetchShot(handle: Long, size: Long): Triple<String?, ByteArray, String>? {
-        log.log("Fetching shot ${hexL(handle)} (${size} bytes announced)")
-        fun t(op: Int, p: List<Long>, ms: Int = 15000) = try { client.transaction(op, p, timeoutMs = ms) }
-            catch (e: java.net.SocketTimeoutException) { log.log("  ${hex16(op)} timed out"); null }
-
-        t(PtpOp.GET_OBJECT, listOf(handle))?.let { r -> tryJpeg("GetObject", r)?.let { return Triple(null, it, "GetObject") } }
-        if (size > 0) t(PtpOp.GET_PARTIAL_OBJECT, listOf(handle, 0, size))?.let { r ->
-            tryJpeg("GetPartialObject", r)?.let { return Triple(null, it, "GetPartialObject") }
-        }
-        t(PtpOp.GET_THUMB, listOf(handle))?.let { r -> tryJpeg("GetThumb", r)?.let { return Triple(null, it, "GetThumb") } }
-
-        // Storage access may only open up once the capture session is closed.
-        terminateCapture()
-        t(PtpOp.GET_OBJECT_INFO, listOf(handle), 5000)?.let { r -> log.log("  GetObjectInfo after terminate: ${PtpResp.name(r.code)}") }
-        val hs = t(PtpOp.GET_OBJECT_HANDLES, listOf(0xFFFFFFFFL, 0, 0), 15000)
-        val handles = hs?.data?.takeIf { hs.ok && it.size >= 4 }?.let { d -> val n = d.u32(0).toInt(); (0 until minOf(n, (d.size - 4) / 4)).map { d.u32(4 + it * 4) } } ?: emptyList()
-        log.log("  GetObjectHandles: ${hs?.let { PtpResp.name(it.code) }}, ${handles.size} objects, last ${handles.takeLast(3).joinToString { hexL(it) }}")
-        for (h in listOfNotNull(handle.takeIf { it in handles }, handles.lastOrNull()).distinct()) {
-            val info = objectInfo(h) ?: continue
-            log.log("  object ${hexL(h)}: ${info.filename} ${info.size} bytes format ${hex16(info.format)}")
-            if (!info.isJpeg) continue
-            val bytes = download(info) {}
-            if (bytes != null && jpegStart(bytes) == 0) return Triple(info.filename, bytes, "GetObjectHandles+download")
-        }
-        return null
+    fun fetchNewestJpeg(progress: (Float) -> Unit): Triple<String, ByteArray, String>? {
+        val n = numObjects
+        if (n <= 0) { log.log("  camera reported no objects ($n)"); return null }
+        val candidates = (listOf(1L, 2L, 3L) + listOf(n.toLong(), n - 1L, n - 2L)).filter { it in 1..n.toLong() }.distinct()
+        val infos = candidates.mapNotNull { h -> objectInfo(h)?.also { log.log("  object $h: ${it.filename} ${it.size / 1024} KB format ${hex16(it.format)}") } }
+        val best = infos.filter { it.isJpeg }.maxByOrNull { dscfNumber(it.filename) }
+            ?: run { log.log("  no JPEG among the newest objects"); return null }
+        log.log("  downloading ${best.filename}")
+        val bytes = download(best, progress) ?: return null
+        return Triple(best.filename, bytes, "gallery object ${best.handle}")
     }
 
     /** Codes the camera listed as remotely controllable (empty if it sent no list). */
