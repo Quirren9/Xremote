@@ -10,7 +10,8 @@
 
     <application
         android:label="X Remote"
-        android:icon="@drawable/ic_launcher"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:theme="@style/Theme.XRemote"
         android:supportsRtl="true">
         <activity

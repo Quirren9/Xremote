@@ -97,17 +97,17 @@ import kotlin.math.sin
 import kotlin.random.Random
 
 // ---- Silver body palette: brushed aluminium top plate, black leatherette, white engraving ----
-private val SilverHi = Color(0xFFF1F1EE)
-private val Silver = Color(0xFFCFD0CC)
-private val SilverMid = Color(0xFFAEAFAB)
-private val SilverLo = Color(0xFF858683)
-private val Leather = Color(0xFF141414)
-private val Engrave = Color(0xFFF3F3EF)
-private val EngraveDark = Color(0xFF2B2B2B)
-private val Lens = Color(0xFF070707)
+internal val SilverHi = Color(0xFFF1F1EE)
+internal val Silver = Color(0xFFCFD0CC)
+internal val SilverMid = Color(0xFFAEAFAB)
+internal val SilverLo = Color(0xFF858683)
+internal val Leather = Color(0xFF141414)
+internal val Engrave = Color(0xFFF3F3EF)
+internal val EngraveDark = Color(0xFF2B2B2B)
+internal val Lens = Color(0xFF070707)
 private const val FILM_SIM = 0xD001
 
-private val evfText = TextStyle(color = Engrave, fontSize = 12.sp, fontWeight = FontWeight.Medium,
+internal val evfText = TextStyle(color = Engrave, fontSize = 12.sp, fontWeight = FontWeight.Medium,
     letterSpacing = 0.6.sp, shadow = Shadow(Color.Black, Offset(0f, 1f), 3f))
 
 @Composable
@@ -271,7 +271,7 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.knurl(w: Float, h: 
 }
 
 /** Black leatherette with a subtle pebble grain. */
-private fun Modifier.leatherette(): Modifier = this.background(Leather).drawBehind {
+internal fun Modifier.leatherette(): Modifier = this.background(Leather).drawBehind {
     val rnd = Random(7)
     repeat((size.width * size.height / 90f).toInt().coerceAtMost(9000)) {
         val x = rnd.nextFloat() * size.width
@@ -284,7 +284,7 @@ private fun Modifier.leatherette(): Modifier = this.background(Leather).drawBehi
 // ---------------------------------------------------------------- top plate rail (shutter side)
 
 /** Brushed aluminium: fine horizontal grain over a soft vertical sheen. */
-private fun Modifier.brushedSilver(): Modifier = this
+internal fun Modifier.brushedSilver(): Modifier = this
     .background(Brush.horizontalGradient(listOf(SilverMid, SilverHi, Silver, SilverMid)))
     .drawBehind {
         val rnd = Random(3)
@@ -332,7 +332,7 @@ private fun TopPlateRail(
 /** Small black button with an engraved label under it, like Q and AE-L on the body. */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun BodyButton(
+internal fun BodyButton(
     icon: ImageVector, label: String, active: Boolean, onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null, tint: Color = Engrave,
 ) {
@@ -351,7 +351,7 @@ private fun BodyButton(
 
 /** Silver shutter release: knurled collar, domed button, threaded cable-release socket in the middle. */
 @Composable
-private fun ShutterButton(busy: Boolean, onClick: () -> Unit) {
+internal fun ShutterButton(busy: Boolean, onClick: () -> Unit) {
     val src = remember { MutableInteractionSource() }
     val pressed by src.collectIsPressedAsState()
     val s by animateFloatAsState(if (pressed) 0.93f else 1f, label = "press")
