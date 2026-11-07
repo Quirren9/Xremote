@@ -4,6 +4,8 @@ import android.app.Application
 import android.content.ContentValues
 import android.provider.MediaStore
 import android.graphics.Bitmap
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.Network
@@ -47,15 +49,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.math.roundToInt
 
-enum class Mode(val label: String) {
-    /** Only the settings grid; framing and shutter stay on the camera. No live view or capture session. */
-    SETTINGS("Settings"),
-    /** Settings plus a big remote shutter, no live view decoding. */
-    SHUTTER("Remote shutter"),
-    /** Everything: live view, histogram, tap to focus, shutter. */
-    LIVE("Live view"),
-}
-
 sealed interface ConnState {
     data object Idle : ConnState
     data class Working(val message: String) : ConnState
@@ -98,8 +91,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private val _toast = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val toast = _toast.asSharedFlow()
     val cameraName = MutableStateFlow("")
-    val mode = MutableStateFlow(Mode.LIVE)
-    private var lastHost = ""
+    /** Phone torch lights up for shots fired from the app. */
+    val torch = MutableStateFlow(false)
     private val _histogram = MutableStateFlow<FloatArray?>(null)
     /** 64-bin luminance histogram of the live view, normalised to the tallest bin. */
     val histogram = _histogram.asStateFlow()
@@ -108,6 +101,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private val _lastShot = MutableStateFlow<ImageBitmap?>(null)
     /** Preview of the most recent shot, shown as a thumbnail. */
     val lastShot = _lastShot.asStateFlow()
+    /** The shot just taken, shown full size in the viewer until live view frames come back. */
+    private val _review = MutableStateFlow<ImageBitmap?>(null)
+    val review = _review.asStateFlow()
+    @Volatile private var reviewHoldUntilNs = 0L
     /** Short transfer status for the status bar, null when idle. */
     val transfer = MutableStateFlow<String?>(null)
     private val seenHandles = HashSet<Long>()
@@ -149,21 +146,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun logText(): String = synchronized(logBuf) { logBuf.joinToString("\n") }
 
     // ---- connection ----
-    /** Switching mode reconnects, so the camera gets exactly the session that mode needs. */
-    fun switchMode(m: Mode) {
-        if (m == mode.value) return
-        logger.log("Switching to ${m.label} mode")
-        viewModelScope.launch {
-            teardown()
-            _state.value = ConnState.Idle
-            connect(lastHost, m)
-        }
-    }
-
-    fun connect(hostOverride: String, newMode: Mode = mode.value) {
+    fun connect(hostOverride: String) {
         if (_state.value is ConnState.Working || _state.value == ConnState.Connected) return
-        mode.value = newMode
-        lastHost = hostOverride
         viewModelScope.launch {
             try {
                 _state.value = ConnState.Working("Looking for the camera's WiFi network")
@@ -192,7 +176,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     publish(cam)
                 }
                 cameraName.value = cam.deviceInfo?.model ?: cam.client.cameraName ?: "Camera"
-                if (newMode != Mode.SETTINGS) withContext(camIo) {
+                withContext(camIo) {
                     if (!cam.startRemote()) {
                         // Usually a session left open by an app that was killed (e.g. reinstalled) mid-session
                         logger.log("Camera didn't start live view, running the full live view setup once")
@@ -203,12 +187,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                         cam.client.verbose = false
                     }
                 }
-                // Remote shutter mode still opens the live view socket (the camera expects it) but skips decoding
-                if (newMode != Mode.SETTINGS) cam.startStreams(onFrame = ::onFrame, onEvent = ::onCameraEvent)
+                cam.startStreams(onFrame = ::onFrame, onEvent = ::onCameraEvent)
                 _state.value = ConnState.Connected
-                logger.log("Mode: ${newMode.label}")
                 startPolling(cam)
-                if (newMode == Mode.LIVE) startWatchdog(cam)
+                startWatchdog(cam)
             } catch (e: Exception) {
                 logger.log("Connect failed: ${e.javaClass.simpleName}: ${e.message}")
                 teardown()
@@ -318,7 +300,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             if (!autoSave.value) transfer.value = null   // never block the shutter for a preview
             withContext(camIo) {
                 cam.capturePreview()?.let { jpeg ->
-                    BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.let { _lastShot.value = it.asImageBitmap() }
+                    BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.let {
+                        val img = it.asImageBitmap()
+                        _lastShot.value = img
+                        // Without saving, show it briefly; with saving, until live view is back.
+                        reviewHoldUntilNs = System.nanoTime() + if (autoSave.value) 0L else 1_200_000_000L
+                        _review.value = img
+                    }
                 }
             }
             if (autoSave.value) {
@@ -390,7 +378,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private fun onFrame(jpeg: ByteArray) {
         if (framesSeen++ == 0L) logger.log("First live view frame (${jpeg.size} bytes)")
         lastFrameNs = System.nanoTime()
-        if (mode.value != Mode.LIVE) return
+        if (_review.value != null && transfer.value == null && lastFrameNs > reviewHoldUntilNs) _review.value = null
         if (!decoding.compareAndSet(false, true)) return // drop frames while busy
         try {
             val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return
@@ -419,6 +407,34 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val max = bins.max().coerceAtLeast(1f)
         for (i in bins.indices) bins[i] /= max
         return bins
+    }
+
+    // ---- phone torch as a fill light ----
+    private val cameraManager = app.getSystemService(CameraManager::class.java)
+    private val torchId: String? by lazy {
+        runCatching {
+            cameraManager.cameraIdList.firstOrNull { id ->
+                val c = cameraManager.getCameraCharacteristics(id)
+                c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true &&
+                    c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+            }
+        }.getOrNull()
+    }
+
+    fun toggleTorch() {
+        if (torchId == null) { _toast.tryEmit("This phone has no usable flash"); return }
+        torch.value = !torch.value
+        logger.log("Phone light ${if (torch.value) "on" else "off"} for shots")
+    }
+
+    private fun setTorch(on: Boolean) {
+        val id = torchId ?: return
+        runCatching {
+            if (on && Build.VERSION.SDK_INT >= 33) {
+                val max = cameraManager.getCameraCharacteristics(id).get(CameraCharacteristics.FLASH_INFO_STRENGTH_MAXIMUM_LEVEL) ?: 1
+                if (max > 1) cameraManager.turnOnTorchWithStrengthLevel(id, max) else cameraManager.setTorchMode(id, true)
+            } else cameraManager.setTorchMode(id, on)
+        }.onFailure { logger.log("Torch: ${it.message}") }
     }
 
     // ---- controls ----
@@ -452,7 +468,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         _busy.value = true
         viewModelScope.launch {
             logger.log("Shutter")
-            val ok = runCatching { withContext(camIo) { cam.shutter() } }.getOrElse { logger.log("Shutter error: ${it.message}"); false }
+            val light = torch.value
+            if (light) { setTorch(true); delay(250) }   // LED to full brightness and the camera meters with it
+            val ok = try {
+                runCatching { withContext(camIo) { cam.shutter() } }.getOrElse { logger.log("Shutter error: ${it.message}"); false }
+            } finally {
+                if (light) {
+                    // Keep the light on for the whole exposure: shutter speed (0xD240, microseconds) + margin
+                    val us = cam.descs[0xD240]?.current?.let { it and 0x0FFFFFFF } ?: 0L
+                    delay((us / 1000 + 200).coerceIn(200, 30_000))
+                    setTorch(false)
+                }
+            }
             if (!ok) _toast.tryEmit("Shot failed, see log")
             _busy.value = false
         }
@@ -499,6 +526,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         camera?.let { c -> withContext(Dispatchers.IO) { runCatching { c.close() } } }
         camera = null
         _frame.value = null
+        _review.value = null
         _props.value = emptyList()
         _focus.value = null
         _histogram.value = null
@@ -508,6 +536,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        setTorch(false)
         pollJob?.cancel()
         camera?.let { c -> Thread { runCatching { c.close() } }.start() }
         runCatching { cm.bindProcessToNetwork(null) }

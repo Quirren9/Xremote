@@ -36,9 +36,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import nl.quirren.xremote.ConnState
-import nl.quirren.xremote.Mode
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.ExperimentalMaterial3Api
 
 private val steps = listOf(
     "Set the X-T3's shutter dial, ISO dial and aperture ring to A for every setting you want the app to control. Settings on a fixed dial show as read-only.",
@@ -47,12 +44,10 @@ private val steps = listOf(
     "Tap Connect. The first time, the camera asks you to accept the device: press OK on the camera.",
 )
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ConnectScreen(state: ConnState, mode: Mode, onConnect: (String, Mode) -> Unit, onShowLog: () -> Unit) {
+fun ConnectScreen(state: ConnState, onConnect: (String) -> Unit, onShowLog: () -> Unit) {
     val ctx = LocalContext.current
     var host by rememberSaveable { mutableStateOf("") }
-    var chosen by rememberSaveable { mutableStateOf(mode) }
     val working = state is ConnState.Working
 
     Row(
@@ -83,14 +78,8 @@ fun ConnectScreen(state: ConnState, mode: Mode, onConnect: (String, Mode) -> Uni
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                 modifier = Modifier.fillMaxWidth(),
             )
-            Spacer(Modifier.height(12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
-                Mode.entries.forEach { m ->
-                    FilterChip(selected = chosen == m, onClick = { chosen = m }, label = { Text(m.label, fontSize = 12.sp) })
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-            Button(onClick = { onConnect(host, chosen) }, enabled = !working, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+            Spacer(Modifier.height(16.dp))
+            Button(onClick = { onConnect(host) }, enabled = !working, modifier = Modifier.fillMaxWidth().height(52.dp)) {
                 if (working) CircularProgressIndicator(Modifier.size(22.dp), color = Bg, strokeWidth = 2.dp)
                 else Text("Connect", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
             }
