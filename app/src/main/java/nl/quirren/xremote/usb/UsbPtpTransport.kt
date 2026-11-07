@@ -22,6 +22,8 @@ import nl.quirren.xremote.ptp.u32
 import java.io.ByteArrayOutputStream
 import java.net.SocketTimeoutException
 
+private const val CHUNK = 16384
+
 object FujiUsb {
     const val FUJI_VENDOR = 0x04CB
 
@@ -49,6 +51,14 @@ object FujiUsb {
         if (epIn == null || epOut == null) throw IllegalStateException("USB tether interface has no bulk endpoints")
         val conn = um.openDevice(dev) ?: throw IllegalStateException("Android didn't open the USB device (permission?)")
         if (!conn.claimInterface(intf, true)) { conn.close(); throw IllegalStateException("Couldn't claim the camera's USB interface. Close other camera apps and plug in again.") }
+        // Clear a stall left by an earlier session (CLEAR_FEATURE ENDPOINT_HALT) and ask the PTP device status
+        for (e in listOf(epIn, epOut)) {
+            val r = conn.controlTransfer(0x02, 0x01, 0, e.address, null, 0, 1000)
+            log.log("  clear halt ${hex16(e.address)}: $r")
+        }
+        val st = ByteArray(16)
+        val n = conn.controlTransfer(0xA1, 0x67, 0, intf.id, st, st.size, 1000)
+        log.log("  PTP device status: ${if (n >= 4) st.copyOf(n).hex() + " (" + PtpResp.name(st.u16(2)) + ")" else "n=$n"}")
         log.log("USB tether interface claimed (packet ${epIn.maxPacketSize} B, events ${if (epInt != null) "yes" else "no"})")
         return UsbPtpTransport(conn, intf, epIn, epOut, epInt, log, dev.productName)
     }
@@ -70,7 +80,8 @@ class UsbPtpTransport(
     @Volatile private var open = true
     override val connected get() = open
     private val lock = Any()
-    private val buf = ByteArray(1 shl 20)
+    /** Many phones reject a single USB transfer above 16 KB, so everything moves in 16 KB pieces. */
+    private val buf = ByteArray(CHUNK)
     /** Bytes read past the end of the previous container (device without zero-length packets). */
     private var leftover: ByteArray? = null
 
@@ -80,8 +91,8 @@ class UsbPtpTransport(
     private fun write(b: ByteArray, timeoutMs: Int) {
         var off = 0
         while (off < b.size) {
-            val n = conn.bulkTransfer(epOut, b, off, b.size - off, timeoutMs)
-            if (n < 0) throw SocketTimeoutException("USB write timed out")
+            val n = conn.bulkTransfer(epOut, b, off, minOf(CHUNK, b.size - off), timeoutMs)
+            if (n < 0) throw SocketTimeoutException("USB write failed ($n) at byte $off of ${b.size}")
             off += n
         }
         if (b.size % epOut.maxPacketSize == 0) conn.bulkTransfer(epOut, ByteArray(0), 0, timeoutMs)  // ZLP
@@ -96,8 +107,12 @@ class UsbPtpTransport(
             if (need in 0..out.size().toLong()) break
             val remaining = (deadline - System.currentTimeMillis()).toInt()
             if (remaining <= 0) throw SocketTimeoutException("USB read timed out")
+            val t0 = System.currentTimeMillis()
             val n = conn.bulkTransfer(epIn, buf, buf.size, remaining)
-            if (n < 0) throw SocketTimeoutException("USB read timed out")
+            if (n < 0) {
+                val ms = System.currentTimeMillis() - t0
+                throw SocketTimeoutException("USB read failed after $ms ms (got ${out.size()} bytes so far)")
+            }
             if (n == 0) continue   // zero-length packet
             out.write(buf, 0, n)
         }
