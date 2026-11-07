@@ -1,6 +1,8 @@
 package nl.quirren.xremote
 
 import android.app.Application
+import android.content.ContentValues
+import android.provider.MediaStore
 import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.Network
@@ -28,6 +30,9 @@ import kotlinx.coroutines.withTimeout
 import nl.quirren.xremote.ptp.FujiCamera
 import nl.quirren.xremote.ptp.FujiProp
 import nl.quirren.xremote.ptp.KnownProps
+import nl.quirren.xremote.ptp.ObjectInfo
+import nl.quirren.xremote.ptp.u16
+import nl.quirren.xremote.ptp.u32
 import nl.quirren.xremote.ptp.PropDesc
 import nl.quirren.xremote.ptp.PropForm
 import nl.quirren.xremote.ptp.PropGroup
@@ -84,6 +89,15 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private val _toast = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val toast = _toast.asSharedFlow()
     val cameraName = MutableStateFlow("")
+    /** Save every JPEG the camera takes to Pictures/X Remote. */
+    val autoSave = MutableStateFlow(true)
+    /** Short transfer status for the status bar, null when idle. */
+    val transfer = MutableStateFlow<String?>(null)
+    private val seenHandles = HashSet<Long>()
+    @Volatile private var lastFrameNs = 0L
+    private var watchdogJob: Job? = null
+
+    fun toggleAutoSave() { autoSave.value = !autoSave.value; logger.log("Auto-save ${if (autoSave.value) "on" else "off"}") }
 
     /** All camera I/O goes through one thread so transactions never interleave. */
     private val camIo = Dispatchers.IO.limitedParallelism(1)
@@ -149,9 +163,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 cameraName.value = cam.deviceInfo?.model ?: cam.client.cameraName ?: "Camera"
                 withContext(camIo) { cam.startRemote() }
-                cam.startStreams(onFrame = ::onFrame)
+                cam.startStreams(onFrame = ::onFrame, onEvent = ::onCameraEvent)
                 _state.value = ConnState.Connected
                 startPolling(cam)
+                startWatchdog(cam)
             } catch (e: Exception) {
                 logger.log("Connect failed: ${e.javaClass.simpleName}: ${e.message}")
                 teardown()
@@ -192,17 +207,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 delay(400)
                 try {
                     withContext(camIo) {
+                        // The change list's format isn't confirmed on the X-T3, so it only updates status values;
+                        // everything else comes from the direct reads below.
                         val changes = cam.pollChanges()
                         for ((code, v) in changes) {
                             if (code in FujiProp.internal) continue
-                            val d = cam.descs[code]
-                            cam.descs[code] = d?.copy(current = v) ?: PropDesc(code, PtpType.UINT32, true, v, synthetic = true)
+                            if (code in statusCodes) cam.descs[code]?.let { cam.descs[code] = it.copy(current = v) }
                         }
                         // Full refresh every ~3 s, in case the change list isn't supported.
-                        if (tick % 8 == 0) for (code in cam.descs.keys.toList()) {
+                        if (tick % 5 == 0) for (code in cam.descs.keys.toList()) {
                             cam.readValue(code)?.let { cam.descs[code] = cam.descs[code]!!.copy(current = it) }
                         }
-                        if (changes.isNotEmpty() || tick % 8 == 0) publish(cam)
+                        if (changes.isNotEmpty() || tick % 5 == 0) publish(cam)
                     }
                     failures = 0
                 } catch (e: Exception) {
@@ -213,6 +229,81 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 tick++
             }
         }
+    }
+
+    private val statusCodes = setOf(FujiProp.BATTERY, FujiProp.SHOTS_REMAINING, FujiProp.MOVIE_REMAINING, 0x5001)
+
+    /** If live view stops (it pauses after every shot), restart it. */
+    private fun startWatchdog(cam: FujiCamera) {
+        watchdogJob = viewModelScope.launch {
+            var lastRestart = 0L
+            while (isActive) {
+                delay(1000)
+                val now = System.nanoTime()
+                val stalled = lastFrameNs != 0L && now - lastFrameNs > 3_000_000_000L
+                if (stalled && transfer.value == null && now - lastRestart > 6_000_000_000L) {
+                    lastRestart = now
+                    logger.log("Live view stalled, restarting it")
+                    runCatching { withContext(camIo) { cam.startRemote() } }
+                    cam.reconnectLiveView()
+                }
+            }
+        }
+    }
+
+    // ---- photos to phone ----
+    private fun onCameraEvent(code: Int, body: ByteArray) {
+        // body: u16 type, u16 event code, u32 transaction, then u32 params
+        if (body.size < 12) return
+        val event = body.u16(2)
+        val params = (8 until body.size - 3 step 4).map { body.u32(it) }
+        logger.log("Camera event ${hex16(event)} params ${params.joinToString { hexL(it) }}")
+        val cam = camera ?: return
+        val candidates = params.take(2).filter { it in 1L..0x00FFFFFFL }.distinct()
+        if (candidates.isEmpty()) return
+        viewModelScope.launch {
+            for (h in candidates) {
+                if (!seenHandles.add(h)) continue
+                runCatching { fetchAndSave(cam, h) }.onFailure { logger.log("Transfer of ${hexL(h)} failed: ${it.message}") }
+            }
+        }
+    }
+
+    private suspend fun fetchAndSave(cam: FujiCamera, handle: Long) {
+        val info: ObjectInfo = withContext(camIo) { cam.objectInfo(handle) } ?: run {
+            logger.log("Handle ${hexL(handle)} is not an image (no ObjectInfo)"); return
+        }
+        logger.log("New file ${info.filename} (${info.size / 1024} KB, format ${hex16(info.format)})")
+        if (!autoSave.value) return
+        if (!info.isJpeg) { logger.log("Skipping ${info.filename}: only JPEGs are saved"); return }
+        transfer.value = "Saving 0%"
+        try {
+            val bytes = withContext(camIo) {
+                cam.download(info) { f -> transfer.value = "Saving ${(f * 100).toInt()}%" }
+            } ?: run { logger.log("Download of ${info.filename} failed"); _toast.tryEmit("Couldn't copy ${info.filename}"); return }
+            withContext(Dispatchers.IO) { saveToGallery(info.filename.ifBlank { "XT3_${System.currentTimeMillis()}.JPG" }, bytes) }
+            logger.log("Saved ${info.filename} (${bytes.size / 1024} KB) to Pictures/X Remote")
+            _toast.tryEmit("Saved ${info.filename}")
+        } finally {
+            transfer.value = null
+        }
+        // Make sure live view comes back after the transfer
+        runCatching { withContext(camIo) { cam.startRemote() } }
+        cam.reconnectLiveView()
+    }
+
+    private fun saveToGallery(name: String, bytes: ByteArray) {
+        val resolver = getApplication<Application>().contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/X Remote")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: error("MediaStore insert failed")
+        resolver.openOutputStream(uri)?.use { it.write(bytes) } ?: error("Can't open output")
+        values.clear(); values.put(MediaStore.Images.Media.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
     }
 
     private fun publish(cam: FujiCamera) {
@@ -241,6 +332,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun onFrame(jpeg: ByteArray) {
         if (framesSeen++ == 0L) logger.log("First live view frame (${jpeg.size} bytes)")
+        lastFrameNs = System.nanoTime()
         if (!decoding.compareAndSet(false, true)) return // drop frames while busy
         try {
             val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return
@@ -263,10 +355,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             logger.log("Set $name -> ${KnownProps.format(code, value)} (${hexL(value)})")
             val ok = runCatching { withContext(camIo) {
                 val ok = cam.setValue(code, value)
-                cam.readValue(code)?.let { v -> cam.descs[code]?.let { cam.descs[code] = it.copy(current = v) } }
+                val back = cam.readValue(code)
+                logger.log("  -> ${if (ok) "accepted" else "refused"}, camera now reports ${back?.let { KnownProps.format(code, it) + " (" + hexL(it) + ")" } ?: "nothing"}")
+                back?.let { v -> cam.descs[code]?.let { cam.descs[code] = it.copy(current = v) } }
                 publish(cam)
                 ok
             } }.getOrElse { logger.log("Set failed: ${it.message}"); false }
+            // Read once more a second later: catches the camera reverting a value on its own
+            delay(1200)
+            runCatching { withContext(camIo) {
+                val later = cam.readValue(code)
+                if (later != null && later != value) logger.log("  ! ${KnownProps.nameOf(code)} is ${KnownProps.format(code, later)} (${hexL(later)}) 1.2 s later")
+            } }
             if (!ok) _toast.tryEmit("Camera refused $name. Check that its dial or ring is on A.")
         }
     }
@@ -317,6 +417,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun teardown() {
         pollJob?.cancel(); pollJob = null
+        watchdogJob?.cancel(); watchdogJob = null
+        lastFrameNs = 0L
+        seenHandles.clear()
+        transfer.value = null
         camera?.let { c -> withContext(Dispatchers.IO) { runCatching { c.close() } } }
         camera = null
         _frame.value = null

@@ -33,6 +33,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.FileDownloadOff
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Terminal
@@ -82,6 +84,8 @@ fun RemoteScreen(vm: RemoteViewModel, onShowLog: () -> Unit) {
     val busy by vm.busy.collectAsStateWithLifecycle()
     val focus by vm.focus.collectAsStateWithLifecycle()
     val name by vm.cameraName.collectAsStateWithLifecycle()
+    val autoSave by vm.autoSave.collectAsStateWithLifecycle()
+    val transfer by vm.transfer.collectAsStateWithLifecycle()
     var selected by remember { mutableStateOf<Int?>(null) }
 
     Row(Modifier.fillMaxSize().background(Bg).safeDrawingPadding()) {
@@ -93,7 +97,7 @@ fun RemoteScreen(vm: RemoteViewModel, onShowLog: () -> Unit) {
         )
         Box(Modifier.weight(1f).fillMaxHeight()) {
             LiveView(frame, focus, onTap = vm::tapFocus, modifier = Modifier.fillMaxSize())
-            StatusBar(name, props, fps, Modifier.align(Alignment.TopCenter).padding(8.dp))
+            StatusBar(name, props, fps, transfer, Modifier.align(Alignment.TopCenter).padding(8.dp))
             val sel = selected?.let { c -> props.find { it.code == c } }
             if (sel != null) {
                 ValuePicker(
@@ -104,7 +108,7 @@ fun RemoteScreen(vm: RemoteViewModel, onShowLog: () -> Unit) {
                 )
             }
         }
-        ShutterRail(busy, onShutter = vm::shutter, onLog = onShowLog, onDisconnect = vm::disconnect)
+        ShutterRail(busy, autoSave, onShutter = vm::shutter, onLog = onShowLog, onToggleSave = vm::toggleAutoSave, onDisconnect = vm::disconnect)
     }
 }
 
@@ -186,7 +190,7 @@ private fun LiveView(frame: ImageBitmap?, focus: Pair<Float, Float>?, onTap: (Fl
 }
 
 @Composable
-private fun StatusBar(name: String, props: List<PropUi>, fps: Float, modifier: Modifier) {
+private fun StatusBar(name: String, props: List<PropUi>, fps: Float, transfer: String?, modifier: Modifier) {
     val status = props.filter { it.group == PropGroup.STATUS }
     Row(
         modifier.clip(RoundedCornerShape(8.dp)).background(Color.Black.copy(alpha = 0.55f)).padding(horizontal = 10.dp, vertical = 4.dp),
@@ -196,6 +200,7 @@ private fun StatusBar(name: String, props: List<PropUi>, fps: Float, modifier: M
         Text(name, color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         status.forEach { Text("${it.short} ${it.text}", color = TextHi, fontSize = 12.sp) }
         Text(String.format(Locale.US, "%.0f fps", fps), color = TextDim, fontSize = 12.sp)
+        if (transfer != null) Text(transfer, color = Accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -250,14 +255,20 @@ private fun ValuePicker(prop: PropUi, onPick: (Long) -> Unit, onClose: () -> Uni
 }
 
 @Composable
-private fun ShutterRail(busy: Boolean, onShutter: () -> Unit, onLog: () -> Unit, onDisconnect: () -> Unit) {
+private fun ShutterRail(busy: Boolean, autoSave: Boolean, onShutter: () -> Unit, onLog: () -> Unit, onToggleSave: () -> Unit, onDisconnect: () -> Unit) {
     val haptic = LocalHapticFeedback.current
     Column(
         Modifier.width(104.dp).fillMaxHeight().background(Panel).padding(vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.SpaceBetween,
     ) {
-        IconButton(onClick = onLog) { Icon(Icons.Default.Terminal, "Log", tint = TextDim) }
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            IconButton(onClick = onLog) { Icon(Icons.Default.Terminal, "Log", tint = TextDim) }
+            IconButton(onClick = onToggleSave) {
+                Icon(if (autoSave) Icons.Default.Download else Icons.Default.FileDownloadOff,
+                    if (autoSave) "Saving shots to phone" else "Not saving shots", tint = if (autoSave) Accent else TextDim)
+            }
+        }
         Box(
             Modifier.size(78.dp).clip(CircleShape).border(4.dp, TextHi, CircleShape)
                 .clickable(enabled = !busy) { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onShutter() }

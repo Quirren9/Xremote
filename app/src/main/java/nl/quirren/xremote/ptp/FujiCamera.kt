@@ -70,7 +70,7 @@ class FujiCamera(
             if (len < 8 || off + len > data.size) { log.log("Capabilities entry $i has bad length $len, stopping"); break }
             try {
                 val d = PropDesc.parse(data.copyOfRange(off + 4, off + len))
-                if (d.code !in FujiProp.internal) { descs[d.code] = d; parsed++ }
+                if (d.code !in FujiProp.internal) { descs[d.code] = d; capCodes += d.code; parsed++ }
                 log.log("  cap ${hex16(d.code)} ${KnownProps.nameOf(d.code)} = ${KnownProps.format(d.code, d.current, d.text)}" +
                     " rw=${d.writable} options=${d.choices().size}")
             } catch (e: Exception) {
@@ -140,8 +140,11 @@ class FujiCamera(
         if (!v.ok || d == null || d.isEmpty()) return null
         val type = when (d.size) { 1 -> PtpType.UINT8; 2 -> PtpType.UINT16; 8 -> PtpType.UINT64; else -> PtpType.UINT32 }
         val value = when (d.size) { 1 -> d.u8(0).toLong(); 2 -> d.u16(0).toLong(); else -> d.u32(0) }
-        return PropDesc(code, type, writable = code !in readOnlyGuess, current = value, synthetic = true)
+        val writable = if (fromCapabilities) code == FujiProp.FOCUS_POINT else code !in readOnlyGuess
+        return PropDesc(code, type, writable = writable, current = value, synthetic = true)
     }
+
+    private var changeLogBudget = 40
 
     private val readOnlyGuess = setOf(FujiProp.BATTERY, 0x5001, FujiProp.SHOTS_REMAINING, FujiProp.MOVIE_REMAINING)
 
@@ -159,6 +162,7 @@ class FujiCamera(
         val d = r.data ?: return emptyMap()
         if (!r.ok || d.size < 2) return emptyMap()
         val n = d.u16(0)
+        if (n > 0 && changeLogBudget > 0) { changeLogBudget--; log.log("D212 raw: ${d.hex(80)}") }
         if (d.size < 2 + n * 6) return emptyMap()
         val out = HashMap<Int, Long>()
         val rd = LeReader(d, 2)
@@ -190,9 +194,44 @@ class FujiCamera(
 
     fun shutter(): Boolean {
         setRaw(FujiProp.SHUTTER_PRESS, 0x0200, 2)
-        val r = client.transaction(PtpOp.INITIATE_CAPTURE, listOf(0, 0), timeoutMs = 20000)
+        val r = client.transaction(PtpOp.INITIATE_CAPTURE, listOf(0, 0), timeoutMs = 8000)
+        log.log("Capture: ${PtpResp.name(r.code)}")
         return r.ok
     }
+
+    fun objectInfo(handle: Long): ObjectInfo? {
+        val r = client.transaction(PtpOp.GET_OBJECT_INFO, listOf(handle), timeoutMs = 5000)
+        val d = r.data ?: return null
+        if (!r.ok || d.isEmpty()) return null
+        return try { ObjectInfo.parse(handle, d) } catch (e: Exception) { log.log("ObjectInfo parse: ${e.message}"); null }
+    }
+
+    /** Downloads an object in 512 KB chunks (falls back to a single GetObject). */
+    fun download(info: ObjectInfo, progress: (Float) -> Unit): ByteArray? {
+        val chunk = 512L * 1024
+        val out = java.io.ByteArrayOutputStream(info.size.toInt().coerceAtLeast(0))
+        var off = 0L
+        while (info.size > 0 && off < info.size) {
+            val n = minOf(chunk, info.size - off)
+            val r = client.transaction(PtpOp.GET_PARTIAL_OBJECT, listOf(info.handle, off, n), timeoutMs = 15000)
+            val d = r.data
+            if (!r.ok || d == null || d.isEmpty()) {
+                if (off == 0L) break   // partial reads not supported: try the whole object
+                log.log("Download stopped at $off/${info.size}: ${PtpResp.name(r.code)}"); return null
+            }
+            out.write(d); off += d.size
+            progress(off.toFloat() / info.size)
+        }
+        if (off > 0) return out.toByteArray()
+        val r = client.transaction(PtpOp.GET_OBJECT, listOf(info.handle), timeoutMs = 60000)
+        return if (r.ok) r.data else null
+    }
+
+    fun reconnectLiveView() = liveView?.reconnect()
+
+    /** Codes the camera listed as remotely controllable (empty if it sent no list). */
+    val controllable: Set<Int> get() = if (fromCapabilities) capCodes else emptySet()
+    private val capCodes = HashSet<Int>()
 
     /** x/y in the camera's focus grid. */
     fun setFocusPoint(x: Int, y: Int): Boolean = setValue(FujiProp.FOCUS_POINT, ((x and 0xFF) shl 8 or (y and 0xFF)).toLong())

@@ -57,6 +57,26 @@ PROPS = {p.code: p for p in [
 ]}
 changed = {}
 lock = threading.Lock()
+event_socks = []
+PHOTOS = {}   # handle -> (filename, jpeg bytes)
+
+def make_photo():
+    try:
+        from PIL import Image
+        img = Image.new("RGB", (1200, 800), (90, 140, 200)); b = io.BytesIO(); img.save(b, "JPEG", quality=85); return b.getvalue()
+    except Exception:
+        return b"\xff\xd8" + b"\x00" * 200000 + b"\xff\xd9"
+
+def object_info(h):
+    name, data = PHOTOS[h]
+    return (struct.pack("<IHHI", 0x10000001, 0x3801, 0, len(data)) + struct.pack("<HIII", 0x3808, 0, 0, 0)
+            + struct.pack("<IIIIHII", 1200, 800, 24, 0, 0, 0, 0) + ptp_str(name) + ptp_str("") + ptp_str("") + ptp_str(""))
+
+def send_event(code, *params):
+    pkt = struct.pack("<HHI", 4, code, 1) + b"".join(struct.pack("<I", p) for p in params)
+    for es in list(event_socks):
+        try: es.sendall(struct.pack("<I", 4 + len(pkt)) + pkt)
+        except Exception: event_socks.remove(es)
 
 def container(typ, code, tid, payload=b""):
     return struct.pack("<IHHI", 12 + len(payload), typ, code, tid) + payload
@@ -133,7 +153,14 @@ def run(code, params, data):
             p.value = v; print(f"[ctl] set {p0:#06x} = {v:#x}"); return OK, None
         if code == 0x100E:
             time.sleep(0.3); PROPS[0xD229].value -= 1; changed[0xD229] = PROPS[0xD229].value
-            print("[ctl] *click*"); return OK, None
+            h = 0x220 + 6 * len(PHOTOS); PHOTOS[h] = (f"DSCF{1000 + len(PHOTOS):04d}.JPG", make_photo())
+            threading.Timer(0.5, lambda: (send_event(0xC004, h - 6, h - 6), send_event(0xC001, h, h, 0x64a8))).start()
+            print(f"[ctl] *click* -> handle {h:#x}"); return OK, None
+        if code == 0x1008:
+            return (OK, object_info(p0)) if p0 in PHOTOS else (0x2009, None)
+        if code == 0x101B:
+            if p0 not in PHOTOS: return 0x2009, None
+            data = PHOTOS[p0][1]; off, n = params[1], params[2]; return OK, data[off:off + n]
     return NOT_SUPPORTED, None
 
 def frames():
@@ -156,6 +183,7 @@ def handle_liveview(s):
         time.sleep(1 / 25)
 
 def handle_events(s):
+    event_socks.append(s)
     while True:
         time.sleep(30)
 

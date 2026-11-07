@@ -104,6 +104,12 @@ class LiveViewStream(
         }
     }
 
+    /** Drops the current socket so the loop reconnects (or restarts the loop if it gave up). */
+    fun reconnect() {
+        try { socket?.close() } catch (_: Exception) {}
+        if (thread?.isAlive != true && running) start()
+    }
+
     fun stop() {
         running = false
         try { socket?.close() } catch (_: Exception) {}

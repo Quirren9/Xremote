@@ -75,3 +75,22 @@ data class DeviceInfo(
         }
     }
 }
+
+data class ObjectInfo(val handle: Long, val format: Int, val size: Long, val filename: String) {
+    val isJpeg get() = format == 0x3801 || filename.endsWith(".JPG", true) || filename.endsWith(".JPEG", true)
+
+    companion object {
+        fun parse(handle: Long, data: ByteArray): ObjectInfo {
+            val r = LeReader(data)
+            r.u32()                 // storage id
+            val fmt = r.u16()
+            r.u16()                 // protection
+            val size = r.u32()
+            r.u16(); r.u32(); r.u32(); r.u32()   // thumb format, size, w, h
+            r.u32(); r.u32(); r.u32()            // image w, h, bit depth
+            r.u32(); r.u16(); r.u32(); r.u32()   // parent, association type/desc, sequence
+            val name = r.ptpString()
+            return ObjectInfo(handle, fmt, size, name)
+        }
+    }
+}
