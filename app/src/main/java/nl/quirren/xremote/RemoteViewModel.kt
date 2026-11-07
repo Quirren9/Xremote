@@ -11,6 +11,8 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.WifiNetworkSpecifier
+import android.os.PatternMatcher
 import android.os.Build
 import android.util.Log
 import androidx.compose.ui.graphics.ImageBitmap
@@ -27,9 +29,10 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import nl.quirren.xremote.ptp.FujiCamera
 import nl.quirren.xremote.ptp.FujiProp
 import nl.quirren.xremote.ptp.KnownProps
@@ -46,7 +49,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.coroutines.resume
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.roundToInt
 
 sealed interface ConnState {
@@ -55,6 +58,9 @@ sealed interface ConnState {
     data object Connected : ConnState
     data class Failed(val message: String) : ConnState
 }
+
+/** Background saving: photos waiting, and which one of the batch is being copied. */
+data class SaveUi(val waiting: Int, val active: Boolean, val index: Int = 0, val total: Int = 0, val frac: Float = 0f, val pausing: Boolean = false)
 
 data class PropUi(
     val code: Int,
@@ -105,13 +111,20 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private val _review = MutableStateFlow<ImageBitmap?>(null)
     val review = _review.asStateFlow()
     @Volatile private var reviewHoldUntilNs = 0L
-    /** Short transfer status for the status bar, null when idle. */
-    val transfer = MutableStateFlow<String?>(null)
+    /** Background save queue, null when nothing is waiting. */
+    val saving = MutableStateFlow<SaveUi?>(null)
+    /** Shots taken but not yet copied. Kept across reconnects: the photos stay on the card. */
+    private val pending = AtomicInteger(0)
+    @Volatile private var batchRunning = false
+    @Volatile private var yieldReq = false
+    @Volatile private var lastActivityNs = 0L
+    private val savedNames = HashSet<String>()
+    private var saverJob: Job? = null
     private val seenHandles = HashSet<Long>()
     @Volatile private var lastFrameNs = 0L
     private var watchdogJob: Job? = null
 
-    fun toggleAutoSave() { autoSave.value = !autoSave.value; logger.log("Auto-save ${if (autoSave.value) "on" else "off"}") }
+    fun toggleAutoSave() { autoSave.value = !autoSave.value; logger.log("Auto-save ${if (autoSave.value) "on" else "off"}"); updateSaveUi() }
 
     /** All camera I/O goes through one thread so transactions never interleave. */
     private val camIo = Dispatchers.IO.limitedParallelism(1)
@@ -146,75 +159,130 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun logText(): String = synchronized(logBuf) { logBuf.joinToString("\n") }
 
     // ---- connection ----
+    @Volatile private var userDisconnected = false
+    private var reconnectJob: Job? = null
+    private var autoConnectTried = false
+    private var lastHost = ""
+    private val netFlow = MutableStateFlow<Network?>(null)
+    /** 0 = no request, 1 = whatever WiFi the phone is on, 2 = Android's network picker for FUJIFILM-... */
+    private var netMode = 0
+    @Volatile private var netUnavailable = false
+
+    /** Connect once when the app opens, so a camera that's already on just works. */
+    fun autoConnect() {
+        if (autoConnectTried) return
+        autoConnectTried = true
+        connect("")
+    }
+
     fun connect(hostOverride: String) {
         if (_state.value is ConnState.Working || _state.value == ConnState.Connected) return
+        userDisconnected = false
+        lastHost = hostOverride
         viewModelScope.launch {
             try {
-                _state.value = ConnState.Working("Looking for the camera's WiFi network")
-                val net = try {
-                    withTimeout(10_000) { requestWifi() }
-                } catch (e: Exception) {
-                    throw IllegalStateException("No WiFi network found. Connect the phone to the camera's FUJIFILM-... network first.")
-                }
-                network = net
-                cm.bindProcessToNetwork(net)
-                val gateway = gatewayOf(net)
-                if (hostOverride.isBlank() && gateway != null && gateway != "192.168.0.1") {
-                    throw IllegalStateException("The phone is on another WiFi network ($gateway). Connect to the camera's FUJIFILM-... network, and turn off auto-reconnect for your home WiFi if Android keeps switching back.")
-                }
-                val host = hostOverride.trim().ifEmpty { gateway ?: "192.168.0.1" }
-                logger.log("Using WiFi network $net, camera host $host")
-
-                _state.value = ConnState.Working("Connecting to $host\nIf the camera asks to accept a new device, press OK on it.")
-                val cam = FujiCamera(net.socketFactory, host, logger)
-                camera = cam
-                withContext(camIo) {
-                    cam.connect("X Remote ${Build.MODEL}".take(26))
-                    _state.value = ConnState.Working("Reading camera settings")
-                    cam.discover()
-                    cam.client.verbose = false
-                    publish(cam)
-                }
-                cameraName.value = cam.deviceInfo?.model ?: cam.client.cameraName ?: "Camera"
-                withContext(camIo) {
-                    if (!cam.startRemote()) {
-                        // Usually a session left open by an app that was killed (e.g. reinstalled) mid-session
-                        logger.log("Camera didn't start live view, running the full live view setup once")
-                        _state.value = ConnState.Working("Waking up the camera's live view")
-                        cam.client.verbose = true
-                        cam.endLiveView()
-                        cam.enterLiveView()
-                        cam.client.verbose = false
-                    }
-                }
-                cam.startStreams(onFrame = ::onFrame, onEvent = ::onCameraEvent)
-                _state.value = ConnState.Connected
-                startPolling(cam)
-                startWatchdog(cam)
+                connectOnce(hostOverride, allowPicker = true)
             } catch (e: Exception) {
                 logger.log("Connect failed: ${e.javaClass.simpleName}: ${e.message}")
-                teardown()
+                teardown(releaseNetwork = false)
                 _state.value = ConnState.Failed(e.message ?: e.javaClass.simpleName)
             }
         }
     }
 
-    private suspend fun requestWifi(): Network = suspendCancellableCoroutine { cont ->
-        val req = NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) // camera WiFi has no internet
-            .build()
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(n: Network) { if (cont.isActive) cont.resume(n) }
-            override fun onLost(n: Network) {
-                if (n == network && _state.value == ConnState.Connected) {
-                    lost("Camera WiFi disconnected")
-                }
+    private suspend fun connectOnce(hostOverride: String, allowPicker: Boolean) {
+        _state.value = ConnState.Working("Looking for the camera's WiFi")
+        val net = cameraNetwork(hostOverride, allowPicker)
+        network = net
+        cm.bindProcessToNetwork(net)
+        val gateway = gatewayOf(net)
+        val host = hostOverride.trim().ifEmpty { gateway ?: "192.168.0.1" }
+        logger.log("Using WiFi network $net, camera host $host")
+
+        _state.value = ConnState.Working("Connecting to the camera\nIf the camera asks to accept a new device, press OK on it.")
+        val cam = FujiCamera(net.socketFactory, host, logger)
+        camera = cam
+        withContext(camIo) {
+            cam.connect("X Remote ${Build.MODEL}".take(26))
+            _state.value = ConnState.Working("Reading camera settings")
+            cam.discover()
+            cam.client.verbose = false
+            publish(cam)
+        }
+        cameraName.value = cam.deviceInfo?.model ?: cam.client.cameraName ?: "Camera"
+        withContext(camIo) {
+            if (!cam.startRemote()) {
+                // Usually a session left open by an app that was killed (e.g. reinstalled) mid-session
+                logger.log("Camera didn't start live view, running the full live view setup once")
+                _state.value = ConnState.Working("Waking up the camera's live view")
+                cam.client.verbose = true
+                cam.endLiveView()
+                cam.enterLiveView()
+                cam.client.verbose = false
             }
         }
+        cam.startStreams(onFrame = ::onFrame, onEvent = ::onCameraEvent)
+        _state.value = ConnState.Connected
+        startPolling(cam)
+        startWatchdog(cam)
+        startSaver(cam)
+        updateSaveUi()
+    }
+
+    /** The camera's network: the WiFi the phone is on if that's the camera, otherwise Android's picker. */
+    private suspend fun cameraNetwork(hostOverride: String, allowPicker: Boolean): Network {
+        if (netMode == 0) registerNet(picker = false)
+        val first = withTimeoutOrNull(if (netMode == 2) 8_000L else 3_000L) { netFlow.filterNotNull().first() }
+        if (first != null && (hostOverride.isNotBlank() || isCameraNet(first))) return first
+        if (!allowPicker) throw IllegalStateException("Camera WiFi not found")
+        if (first != null) logger.log("Phone is on another WiFi (${gatewayOf(first)}), asking Android for the camera's network")
+        releaseNet()
+        registerNet(picker = true)
+        _state.value = ConnState.Working("Pick the camera's FUJIFILM-... network in the window that opens.\nNo window or no network listed? Start wireless communication on the camera first.")
+        val picked = withTimeoutOrNull(60_000L) {
+            while (netFlow.value == null && !netUnavailable) delay(100)
+            netFlow.value
+        }
+        return picked ?: run {
+            releaseNet()
+            throw IllegalStateException("Camera WiFi not found. Start wireless communication on the camera, then tap Connect.")
+        }
+    }
+
+    private fun isCameraNet(n: Network): Boolean = gatewayOf(n).let { it == null || it == "192.168.0.1" }
+
+    private fun registerNet(picker: Boolean) {
+        val b = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) // camera WiFi has no internet
+        if (picker) b.setNetworkSpecifier(
+            WifiNetworkSpecifier.Builder()
+                .setSsidPattern(PatternMatcher("FUJIFILM", PatternMatcher.PATTERN_PREFIX))
+                .build()
+        )
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(n: Network) { netFlow.value = n }
+            override fun onLost(n: Network) {
+                if (netFlow.value == n) netFlow.value = null
+                if (n == network && _state.value == ConnState.Connected) lost("Camera WiFi disconnected")
+            }
+            override fun onUnavailable() { netUnavailable = true; logger.log("No camera network chosen") }
+        }
+        try {
+            cm.requestNetwork(b.build(), cb)
+        } catch (e: Exception) {
+            logger.log("WiFi request failed: ${e.message}")
+            throw IllegalStateException("Android refused the WiFi request. Join the FUJIFILM-... network in WiFi settings, then tap Connect.")
+        }
         netCallback = cb
-        cm.requestNetwork(req, cb)
-        cont.invokeOnCancellation { runCatching { cm.unregisterNetworkCallback(cb) }; netCallback = null }
+        netUnavailable = false
+        netMode = if (picker) 2 else 1
+    }
+
+    private fun releaseNet() {
+        netCallback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
+        netCallback = null; netFlow.value = null; netMode = 0; network = null
+        runCatching { cm.bindProcessToNetwork(null) }
     }
 
     private fun gatewayOf(net: Network): String? {
@@ -238,7 +306,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                         if (cam.inGallery) return@withContext   // gallery-mode snapshots mean something else
                         for ((code, v) in changes) {
                             if (code in FujiProp.internal) continue
-                            cam.descs[code]?.let { cam.descs[code] = it.copy(current = v) }
+                            val d = cam.descs[code]
+                            if (d != null) cam.descs[code] = d.copy(current = v)
+                            else if (code in infoCodes) cam.descs[code] = PropDesc(code, PtpType.UINT32, writable = false, current = v, synthetic = true)
                         }
                         // Direct reads only when the camera sends no snapshot
                         if (changes.isEmpty() && tick % 5 == 0) for (code in cam.descs.keys.toList()) {
@@ -257,6 +327,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Read-only values the camera reports in its snapshot, shown as info tiles (set by the camera's dials). */
+    private val infoCodes = setOf(0x500E, 0xD240, 0xD018)
+
     private val statusCodes = setOf(FujiProp.BATTERY, FujiProp.SHOTS_REMAINING, FujiProp.MOVIE_REMAINING, 0x5001)
 
     /** If live view stops (it pauses after every shot), restart it. */
@@ -267,7 +340,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 delay(1000)
                 val now = System.nanoTime()
                 val stalled = lastFrameNs != 0L && now - lastFrameNs > 4_000_000_000L
-                if (stalled && transfer.value == null && !cam.inGallery && now - lastRestart > 8_000_000_000L) {
+                if (stalled && !batchRunning && !cam.inGallery && now - lastRestart > 8_000_000_000L) {
                     lastRestart = now
                     logger.log("Live view stalled, switching camera back to live view")
                     runCatching { withContext(camIo) { cam.enterLiveView() } }
@@ -293,48 +366,88 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun afterShot(cam: FujiCamera) {
-        transfer.value = if (autoSave.value) "Preview" else null
-        cam.client.verbose = autoSave.value
-        var switched = false
-        try {
-            if (!autoSave.value) transfer.value = null   // never block the shutter for a preview
-            withContext(camIo) {
-                cam.capturePreview()?.let { jpeg ->
-                    BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.let {
-                        val img = it.asImageBitmap()
-                        _lastShot.value = img
-                        // Without saving, show it briefly; with saving, until live view is back.
-                        reviewHoldUntilNs = System.nanoTime() + if (autoSave.value) 0L else 1_200_000_000L
-                        _review.value = img
-                    }
+        withContext(camIo) {
+            cam.capturePreview()?.let { jpeg ->
+                BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.let {
+                    val img = it.asImageBitmap()
+                    _lastShot.value = img
+                    reviewHoldUntilNs = System.nanoTime() + 900_000_000L
+                    _review.value = img
                 }
             }
-            if (autoSave.value) {
-                transfer.value = "Saving"
-                switched = true
-                val shot = withContext(camIo) {
-                    cam.enterGallery()
-                    cam.fetchNewestJpeg { f -> transfer.value = "Saving ${(f * 100).toInt()}%" }
-                }
-                if (shot == null) {
-                    logger.log("Could not copy the photo (see the lines above)")
-                    _toast.tryEmit("Couldn't copy the photo, the log shows why")
-                } else {
-                    val (name, bytes, method) = shot
-                    withContext(Dispatchers.IO) { saveToGallery(name, bytes) }
-                    logger.log("Saved $name (${bytes.size / 1024} KB, $method) to Pictures/X Remote")
-                    _toast.tryEmit("Saved $name")
-                }
-                transfer.value = "Back to live view"
-                runCatching { withContext(camIo) { cam.enterLiveView() } }.onFailure { logger.log("Back to live view failed: ${it.message}") }
-            }
-            // Without a download the camera resumes live view by itself after the preview;
-            // the watchdog switches back explicitly only if frames don't return.
-        } finally {
-            transfer.value = null
-            cam.client.verbose = false
-            if (switched) logger.log("Ready for the next shot")
         }
+        // The camera resumes live view by itself after the preview. Copying happens later, in one go,
+        // once you pause shooting: switching the camera to its gallery and back costs ~3 s per batch.
+        if (autoSave.value) { pending.incrementAndGet(); updateSaveUi() }
+    }
+
+    private fun updateSaveUi() {
+        if (batchRunning) return
+        val n = pending.get()
+        saving.value = if (n > 0 && autoSave.value) SaveUi(waiting = n, active = false) else null
+    }
+
+    /** Copies waiting photos once nothing has happened for a moment. */
+    private fun startSaver(cam: FujiCamera) {
+        saverJob?.cancel()
+        saverJob = viewModelScope.launch {
+            while (isActive) {
+                delay(300)
+                if (pending.get() <= 0 || !autoSave.value || _busy.value) continue
+                if (System.nanoTime() - lastActivityNs < SAVE_IDLE_NS) continue
+                runBatch(cam)
+            }
+        }
+    }
+
+    private suspend fun runBatch(cam: FujiCamera) {
+        batchRunning = true
+        if (System.nanoTime() - lastActivityNs < SAVE_IDLE_NS) { batchRunning = false; return }
+        yieldReq = false
+        val total = pending.get()
+        logger.log("Saving $total photo${if (total == 1) "" else "s"}")
+        saving.value = SaveUi(waiting = total, active = true, total = total)
+        cam.client.verbose = true
+        try {
+            withContext(camIo) {
+                cam.enterGallery()
+                try {
+                    val done = cam.saveNewest(total, shouldStop = { yieldReq },
+                        progress = { i, f -> saving.value = SaveUi(total - i, true, i, total, f, yieldReq) },
+                    ) { name, bytes ->
+                        val fresh = synchronized(savedNames) { savedNames.add(name) }
+                        if (fresh) {
+                            saveToGallery(name, bytes)
+                            logger.log("Saved $name (${bytes.size / 1024} KB) to Pictures/X Remote")
+                        } else logger.log("$name was already saved")
+                    }
+                    pending.updateAndGet { maxOf(0, it - done) }
+                } finally {
+                    cam.enterLiveView()
+                }
+            }
+            if (pending.get() == 0) _toast.tryEmit("Saved $total photo${if (total == 1) "" else "s"}")
+        } catch (e: Exception) {
+            logger.log("Saving stopped: ${e.message}")
+        } finally {
+            cam.client.verbose = false
+            batchRunning = false
+            yieldReq = false
+            lastActivityNs = System.nanoTime()
+            updateSaveUi()
+            logger.log("Ready for the next shot")
+        }
+    }
+
+    /** Before a shot or a setting change: if a save batch is running, stop it after the current photo. */
+    private suspend fun awaitLive(reason: String) {
+        lastActivityNs = System.nanoTime()
+        if (!batchRunning) return
+        yieldReq = true
+        logger.log("Pausing saving for $reason")
+        saving.value = saving.value?.copy(pausing = true)
+        while (batchRunning) delay(40)
+        lastActivityNs = System.nanoTime()
     }
 
     private fun saveToGallery(name: String, bytes: ByteArray) {
@@ -378,7 +491,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private fun onFrame(jpeg: ByteArray) {
         if (framesSeen++ == 0L) logger.log("First live view frame (${jpeg.size} bytes)")
         lastFrameNs = System.nanoTime()
-        if (_review.value != null && transfer.value == null && lastFrameNs > reviewHoldUntilNs) _review.value = null
+        if (_review.value != null && !batchRunning && lastFrameNs > reviewHoldUntilNs) _review.value = null
         if (!decoding.compareAndSet(false, true)) return // drop frames while busy
         try {
             val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return
@@ -442,6 +555,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val cam = camera ?: return
         viewModelScope.launch {
             val name = KnownProps.nameOf(code)
+            awaitLive("a setting")
             logger.log("Set $name -> ${KnownProps.format(code, value)} (${hexL(value)})")
             val ok = runCatching { withContext(camIo) {
                 val ok = cam.setValue(code, value)
@@ -464,9 +578,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun shutter() {
         val cam = camera ?: return
         if (_busy.value) return
-        if (transfer.value != null) { _toast.tryEmit("Wait a moment: ${transfer.value}"); return }
         _busy.value = true
+        lastActivityNs = System.nanoTime()
         viewModelScope.launch {
+            awaitLive("a shot")
             logger.log("Shutter")
             val light = torch.value
             if (light) { setTorch(true); delay(250) }   // LED to full brightness and the camera meters with it
@@ -481,6 +596,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             if (!ok) _toast.tryEmit("Shot failed, see log")
+            lastActivityNs = System.nanoTime()
             _busy.value = false
         }
     }
@@ -495,6 +611,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val y = (ny * maxY).roundToInt().coerceIn(0, maxY)
         _focus.value = x.toFloat() / maxX to y.toFloat() / maxY
         viewModelScope.launch {
+            awaitLive("focus")
             logger.log("Focus point -> $x,$y (grid ${maxX + 1}x${maxY + 1})")
             val ok = runCatching { withContext(camIo) { cam.setFocusPoint(x, y) } }.getOrDefault(false)
             if (!ok) _toast.tryEmit("Camera didn't accept the focus point")
@@ -502,27 +619,49 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun disconnect() {
+        userDisconnected = true
+        reconnectJob?.cancel(); reconnectJob = null
         viewModelScope.launch {
-            teardown()
+            // Never leave the camera in its gallery: it then refuses the next connection
+            if (batchRunning) { yieldReq = true; withTimeoutOrNull(10_000L) { while (batchRunning) delay(50) } }
+            teardown(releaseNetwork = true)
             _state.value = ConnState.Idle
         }
     }
 
-    /** Runs in its own coroutine so it also works when called from the poll job it cancels. */
+    /** Lost the camera: reconnect by itself for a few minutes. Runs in its own coroutine. */
     private fun lost(msg: String) {
         logger.log(msg)
-        viewModelScope.launch {
-            teardown()
-            _state.value = ConnState.Failed(msg)
+        if (userDisconnected || reconnectJob?.isActive == true) return
+        reconnectJob = viewModelScope.launch {
+            teardown(releaseNetwork = false)
+            val start = System.nanoTime()
+            var attempt = 0
+            while (isActive && !userDisconnected) {
+                attempt++
+                _state.value = ConnState.Working("Connection lost, reconnecting (try $attempt)\nKeep the camera on with wireless communication active.")
+                try {
+                    connectOnce(lastHost, allowPicker = attempt % 6 == 0)
+                    logger.log("Reconnected after $attempt tries")
+                    return@launch
+                } catch (e: Exception) {
+                    logger.log("Reconnect $attempt failed: ${e.javaClass.simpleName}: ${e.message}")
+                    teardown(releaseNetwork = false)
+                }
+                if (System.nanoTime() - start > 180_000_000_000L) break
+                delay(2500)
+            }
+            if (!userDisconnected) _state.value = ConnState.Failed("$msg. Tap Connect to try again.")
         }
     }
 
-    private suspend fun teardown() {
+    private suspend fun teardown(releaseNetwork: Boolean) {
         pollJob?.cancel(); pollJob = null
         watchdogJob?.cancel(); watchdogJob = null
+        saverJob?.cancel(); saverJob = null
         lastFrameNs = 0L
         seenHandles.clear()
-        transfer.value = null
+        batchRunning = false; yieldReq = false
         camera?.let { c -> withContext(Dispatchers.IO) { runCatching { c.close() } } }
         camera = null
         _frame.value = null
@@ -530,10 +669,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         _props.value = emptyList()
         _focus.value = null
         _histogram.value = null
-        runCatching { cm.bindProcessToNetwork(null) }
-        netCallback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
-        netCallback = null; network = null
+        saving.value = null
+        if (releaseNetwork) releaseNet()
     }
+
+    private companion object { const val SAVE_IDLE_NS = 2_500_000_000L }
 
     override fun onCleared() {
         setTorch(false)

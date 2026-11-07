@@ -1,5 +1,11 @@
 package nl.quirren.xremote.ui
 
+import nl.quirren.xremote.SaveUi
+import android.widget.Toast
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -89,7 +95,7 @@ fun RemoteScreen(vm: RemoteViewModel, onShowLog: () -> Unit) {
     val focus by vm.focus.collectAsStateWithLifecycle()
     val name by vm.cameraName.collectAsStateWithLifecycle()
     val autoSave by vm.autoSave.collectAsStateWithLifecycle()
-    val transfer by vm.transfer.collectAsStateWithLifecycle()
+    val saving by vm.saving.collectAsStateWithLifecycle()
     val review by vm.review.collectAsStateWithLifecycle()
     val torch by vm.torch.collectAsStateWithLifecycle()
     val histogram by vm.histogram.collectAsStateWithLifecycle()
@@ -114,7 +120,8 @@ fun RemoteScreen(vm: RemoteViewModel, onShowLog: () -> Unit) {
                     modifier = Modifier.fillMaxSize().background(Bg))
             }
             if (review == null) histogram?.let { Histogram(it, Modifier.align(Alignment.BottomStart).padding(10.dp)) }
-            StatusBar(name, props, fps, transfer, Modifier.align(Alignment.TopCenter).padding(8.dp))
+            StatusBar(name, props, fps, Modifier.align(Alignment.TopCenter).padding(8.dp))
+            saving?.let { SaveBadge(it, Modifier.align(Alignment.BottomEnd).padding(10.dp)) }
             picker(Modifier.align(Alignment.BottomCenter).padding(10.dp).fillMaxWidth())
         }
         ShutterRail(
@@ -180,6 +187,28 @@ private fun PropTile(p: PropUi, selected: Boolean, onClick: () -> Unit) {
     }
 }
 
+/** Small corner card: how many shots wait to be copied, and progress while copying. */
+@Composable
+private fun SaveBadge(s: SaveUi, modifier: Modifier) {
+    val label = when {
+        s.pausing -> "Pausing saving..."
+        s.active -> "Saving ${s.index + 1} of ${s.total}"
+        else -> "${s.waiting} to save, starts when you pause"
+    }
+    Column(
+        modifier.width(200.dp).clip(RoundedCornerShape(8.dp)).background(Color.Black.copy(alpha = 0.6f))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Text(label, color = TextHi, fontSize = 12.sp, maxLines = 1)
+        val p = if (s.active && s.total > 0) ((s.index + s.frac) / s.total).coerceIn(0f, 1f) else 0f
+        LinearProgressIndicator(
+            progress = { p },
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp).height(4.dp),
+            color = Accent, trackColor = TileHi,
+        )
+    }
+}
+
 @Composable
 private fun LiveView(frame: ImageBitmap?, focus: Pair<Float, Float>?, onTap: (Float, Float) -> Unit, modifier: Modifier) {
     var box by remember { mutableStateOf(IntSize.Zero) }
@@ -221,7 +250,7 @@ private fun LiveView(frame: ImageBitmap?, focus: Pair<Float, Float>?, onTap: (Fl
 }
 
 @Composable
-private fun StatusBar(name: String, props: List<PropUi>, fps: Float?, transfer: String?, modifier: Modifier) {
+private fun StatusBar(name: String, props: List<PropUi>, fps: Float?, modifier: Modifier) {
     val status = props.filter { it.group == PropGroup.STATUS }
     Row(
         modifier.clip(RoundedCornerShape(8.dp)).background(Color.Black.copy(alpha = 0.55f)).padding(horizontal = 10.dp, vertical = 4.dp),
@@ -231,7 +260,6 @@ private fun StatusBar(name: String, props: List<PropUi>, fps: Float?, transfer: 
         Text(name, color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         status.forEach { Text("${it.short} ${it.text}", color = TextHi, fontSize = 12.sp) }
         if (fps != null) Text(String.format(Locale.US, "%.0f fps", fps), color = TextDim, fontSize = 12.sp)
-        if (transfer != null) Text(transfer, color = Accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -285,6 +313,7 @@ private fun ValuePicker(prop: PropUi, onPick: (Long) -> Unit, onClose: () -> Uni
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ShutterRail(
     busy: Boolean, autoSave: Boolean, torch: Boolean,
@@ -313,6 +342,14 @@ private fun ShutterRail(
                 .padding(9.dp).clip(CircleShape).background(if (busy) TileHi else Accent),
             contentAlignment = Alignment.Center,
         ) { if (busy) CircularProgressIndicator(Modifier.size(28.dp), color = Accent, strokeWidth = 3.dp) }
-        IconButton(onClick = onDisconnect) { Icon(Icons.Default.LinkOff, "Disconnect", tint = Danger) }
+        // Hold to disconnect, so a stray tap can't drop the connection mid-save
+        val ctx = LocalContext.current
+        Box(
+            Modifier.size(48.dp).clip(CircleShape).combinedClickable(
+                onClick = { Toast.makeText(ctx, "Hold to disconnect", Toast.LENGTH_SHORT).show() },
+                onLongClick = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onDisconnect() },
+            ),
+            contentAlignment = Alignment.Center,
+        ) { Icon(Icons.Default.LinkOff, "Hold to disconnect", tint = Danger) }
     }
 }

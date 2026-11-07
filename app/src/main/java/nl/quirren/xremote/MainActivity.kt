@@ -38,6 +38,7 @@ class MainActivity : ComponentActivity() {
                 val state by vm.state.collectAsStateWithLifecycle()
                 var showLog by remember { mutableStateOf(false) }
 
+                LaunchedEffect(Unit) { vm.autoConnect() }
                 LaunchedEffect(Unit) {
                     vm.toast.collect { Toast.makeText(this@MainActivity, it, Toast.LENGTH_SHORT).show() }
                 }
@@ -47,7 +48,7 @@ class MainActivity : ComponentActivity() {
                 }
 
                 if (state == ConnState.Connected) RemoteScreen(vm, onShowLog = { showLog = true })
-                else ConnectScreen(state, onConnect = { vm.connect(it) }, onShowLog = { showLog = true })
+                else ConnectScreen(state, onConnect = { vm.connect(it) }, onStop = { vm.disconnect() }, onShowLog = { showLog = true })
 
                 if (showLog) LogDialog(vm, onDismiss = { showLog = false })
             }

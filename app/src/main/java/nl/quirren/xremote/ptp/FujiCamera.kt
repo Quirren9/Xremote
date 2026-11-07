@@ -291,7 +291,7 @@ class FujiCamera(
         events()
         step("TerminateOpenCapture(#$openCaptureTid)") {
             // The X-T3 never answers this (seen in every log), so don't wait long; a late reply is dropped
-            client.transaction(PtpOp.TERMINATE_OPEN_CAPTURE, listOf(openCaptureTid), timeoutMs = 1500)
+            client.transaction(PtpOp.TERMINATE_OPEN_CAPTURE, listOf(openCaptureTid), timeoutMs = 800)
         }
     }
 
@@ -371,6 +371,41 @@ class FujiCamera(
         log.log("  downloading ${best.filename}")
         val bytes = download(best, progress) ?: return null
         return Triple(best.filename, bytes, "gallery object ${best.handle}")
+    }
+
+    /**
+     * Saves the newest [count] photos, oldest first (gallery handles count..1, handle 1 is the newest).
+     * Oldest first means that if [shouldStop] interrupts, the unsaved ones are always the newest block,
+     * so a plain counter is enough to resume later. Must be called in gallery mode.
+     * Returns how many handles were handled (saved or skipped).
+     */
+    fun saveNewest(
+        count: Int,
+        shouldStop: () -> Boolean,
+        progress: (index: Int, frac: Float) -> Unit,
+        onFile: (name: String, bytes: ByteArray) -> Unit,
+    ): Int {
+        val n = numObjects
+        val todo = if (n > 0) minOf(count, n) else count
+        if (todo <= 0) return 0
+        setStep("EnableCorrectFileSize = 1", FujiProp.ENABLE_CORRECT_FILE_SIZE, 1, 2)
+        var done = 0
+        try {
+            for (h in todo downTo 1) {
+                if (shouldStop()) { log.log("  saving paused, ${todo - done} left"); break }
+                val info = objectInfo(h.toLong())
+                if (info == null) { log.log("  object $h: no info"); done++; continue }
+                log.log("  object $h: ${info.filename} ${info.size / 1024} KB, ${info.width}x${info.height}")
+                if (!info.isJpeg) { done++; continue }
+                val bytes = download(info) { f -> progress(done, f) }
+                if (bytes != null) onFile(info.filename, bytes)
+                done++
+            }
+        } finally {
+            events()
+            setStep("EnableCorrectFileSize = 0", FujiProp.ENABLE_CORRECT_FILE_SIZE, 0, 2)
+        }
+        return done
     }
 
     /** Codes the camera listed as remotely controllable (empty if it sent no list). */

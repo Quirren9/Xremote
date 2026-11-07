@@ -40,12 +40,12 @@ import nl.quirren.xremote.ConnState
 private val steps = listOf(
     "Set the X-T3's shutter dial, ISO dial and aperture ring to A for every setting you want the app to control. Settings on a fixed dial show as read-only.",
     "Start wireless communication on the camera (for example by assigning Wireless Communication to an Fn button). It will show a FUJIFILM-X-T3-... network.",
-    "Join that network in Android's WiFi settings. Android may warn that it has no internet: stay connected.",
-    "Tap Connect. The first time, the camera asks you to accept the device: press OK on the camera.",
+    "Tap Connect (the app also tries by itself when it opens). If the phone isn't on the camera's network, Android shows a list: pick FUJIFILM-X-T3-....",
+    "The first time, the camera asks you to accept the device: press OK on the camera. If the connection drops, the app reconnects by itself.",
 )
 
 @Composable
-fun ConnectScreen(state: ConnState, onConnect: (String) -> Unit, onShowLog: () -> Unit) {
+fun ConnectScreen(state: ConnState, onConnect: (String) -> Unit, onStop: () -> Unit, onShowLog: () -> Unit) {
     val ctx = LocalContext.current
     var host by rememberSaveable { mutableStateOf("") }
     val working = state is ConnState.Working
@@ -90,7 +90,10 @@ fun ConnectScreen(state: ConnState, onConnect: (String) -> Unit, onShowLog: () -
             ) { Text("Open WiFi settings") }
             Spacer(Modifier.height(16.dp))
             when (state) {
-                is ConnState.Working -> Text(state.message, color = TextHi, fontSize = 14.sp)
+                is ConnState.Working -> {
+                    Text(state.message, color = TextHi, fontSize = 14.sp)
+                    TextButton(onClick = onStop) { Text("Stop", color = Danger) }
+                }
                 is ConnState.Failed -> Text(state.message, color = Danger, fontSize = 14.sp)
                 else -> {}
             }
