@@ -30,7 +30,6 @@ import kotlinx.coroutines.withTimeout
 import nl.quirren.xremote.ptp.FujiCamera
 import nl.quirren.xremote.ptp.FujiProp
 import nl.quirren.xremote.ptp.KnownProps
-import nl.quirren.xremote.ptp.ObjectInfo
 import nl.quirren.xremote.ptp.u16
 import nl.quirren.xremote.ptp.u32
 import nl.quirren.xremote.ptp.PropDesc
@@ -210,15 +209,16 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                         // The change list's format isn't confirmed on the X-T3, so it only updates status values;
                         // everything else comes from the direct reads below.
                         val changes = cam.pollChanges()
+                        // D212 = snapshot of (code, value) pairs, decoding confirmed on the X-T3
                         for ((code, v) in changes) {
                             if (code in FujiProp.internal) continue
-                            if (code in statusCodes) cam.descs[code]?.let { cam.descs[code] = it.copy(current = v) }
+                            cam.descs[code]?.let { cam.descs[code] = it.copy(current = v) }
                         }
-                        // Full refresh every ~3 s, in case the change list isn't supported.
-                        if (tick % 5 == 0) for (code in cam.descs.keys.toList()) {
+                        // Direct reads only when the camera sends no snapshot
+                        if (changes.isEmpty() && tick % 5 == 0) for (code in cam.descs.keys.toList()) {
                             cam.readValue(code)?.let { cam.descs[code] = cam.descs[code]!!.copy(current = it) }
                         }
-                        if (changes.isNotEmpty() || tick % 5 == 0) publish(cam)
+                        publish(cam)
                     }
                     failures = 0
                 } catch (e: Exception) {
@@ -244,8 +244,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 if (stalled && transfer.value == null && now - lastRestart > 6_000_000_000L) {
                     lastRestart = now
                     logger.log("Live view stalled, restarting it")
-                    runCatching { withContext(camIo) { cam.startRemote() } }
-                    cam.reconnectLiveView()
+                    runCatching { withContext(camIo) { cam.restartLiveView() } }
                 }
             }
         }
@@ -259,37 +258,37 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val params = (8 until body.size - 3 step 4).map { body.u32(it) }
         logger.log("Camera event ${hex16(event)} params ${params.joinToString { hexL(it) }}")
         val cam = camera ?: return
-        val candidates = params.take(2).filter { it in 1L..0x00FFFFFFL }.distinct()
-        if (candidates.isEmpty()) return
+        // 0xC001 after a shot: (handle, handle, size). 0xC004 comes first and only announces it.
+        if (event != 0xC001 || params.isEmpty()) return
+        val handle = params[0]
+        val size = params.getOrElse(2) { 0L }
+        if (!seenHandles.add(handle)) return
         viewModelScope.launch {
-            for (h in candidates) {
-                if (!seenHandles.add(h)) continue
-                runCatching { fetchAndSave(cam, h) }.onFailure { logger.log("Transfer of ${hexL(h)} failed: ${it.message}") }
-            }
+            runCatching { fetchAndSave(cam, handle, size) }.onFailure { logger.log("Transfer of ${hexL(handle)} failed: ${it.message}") }
         }
     }
 
-    private suspend fun fetchAndSave(cam: FujiCamera, handle: Long) {
-        val info: ObjectInfo = withContext(camIo) { cam.objectInfo(handle) } ?: run {
-            logger.log("Handle ${hexL(handle)} is not an image (no ObjectInfo)"); return
-        }
-        logger.log("New file ${info.filename} (${info.size / 1024} KB, format ${hex16(info.format)})")
-        if (!autoSave.value) return
-        if (!info.isJpeg) { logger.log("Skipping ${info.filename}: only JPEGs are saved"); return }
-        transfer.value = "Saving 0%"
+    private suspend fun fetchAndSave(cam: FujiCamera, handle: Long, size: Long) {
+        transfer.value = if (autoSave.value) "Saving" else null
         try {
-            val bytes = withContext(camIo) {
-                cam.download(info) { f -> transfer.value = "Saving ${(f * 100).toInt()}%" }
-            } ?: run { logger.log("Download of ${info.filename} failed"); _toast.tryEmit("Couldn't copy ${info.filename}"); return }
-            withContext(Dispatchers.IO) { saveToGallery(info.filename.ifBlank { "XT3_${System.currentTimeMillis()}.JPG" }, bytes) }
-            logger.log("Saved ${info.filename} (${bytes.size / 1024} KB) to Pictures/X Remote")
-            _toast.tryEmit("Saved ${info.filename}")
+            if (autoSave.value) {
+                val shot = withContext(camIo) { cam.fetchShot(handle, size) }
+                if (shot == null) {
+                    logger.log("Could not get the image from the camera (see attempts above)")
+                    _toast.tryEmit("Couldn't copy the photo yet, the log shows why")
+                } else {
+                    val (fileName, bytes, method) = shot
+                    val name = fileName?.takeIf { it.isNotBlank() } ?: "XT3_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.JPG"
+                    withContext(Dispatchers.IO) { saveToGallery(name, bytes) }
+                    logger.log("Saved $name (${bytes.size / 1024} KB, via $method) to Pictures/X Remote")
+                    _toast.tryEmit("Saved $name")
+                }
+            }
         } finally {
             transfer.value = null
         }
-        // Make sure live view comes back after the transfer
-        runCatching { withContext(camIo) { cam.startRemote() } }
-        cam.reconnectLiveView()
+        // Bring live view back: the camera keeps it off after a shot until the capture session is reopened
+        runCatching { withContext(camIo) { cam.restartLiveView() } }.onFailure { logger.log("Live view restart failed: ${it.message}") }
     }
 
     private fun saveToGallery(name: String, bytes: ByteArray) {

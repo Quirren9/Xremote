@@ -41,6 +41,9 @@ class FujiPtpClient(
     /** Set to false to stop logging every command (e.g. during fast polling). */
     @Volatile var verbose = true
 
+    /** Transaction id of the most recent command. */
+    val lastTid get() = tid
+
     val connected get() = socket?.isConnected == true && socket?.isClosed == false
 
     fun connect(host: String, port: Int, clientName: String, connectTimeoutMs: Int = 6000, registerTimeoutMs: Int = 45000) {

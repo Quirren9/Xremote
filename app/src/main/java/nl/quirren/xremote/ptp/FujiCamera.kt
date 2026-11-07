@@ -92,7 +92,8 @@ class FujiCamera(
     fun startRemote() {
         try {
             val r = client.transaction(PtpOp.INITIATE_OPEN_CAPTURE, listOf(0, 0), timeoutMs = 5000)
-            log.log("InitiateOpenCapture: ${PtpResp.name(r.code)}")
+            openCaptureTid = client.lastTid
+            log.log("InitiateOpenCapture: ${PtpResp.name(r.code)} (session #$openCaptureTid)")
         } catch (e: java.net.SocketTimeoutException) {
             log.log("InitiateOpenCapture got no reply (continuing, a late reply is ignored)")
         }
@@ -144,7 +145,7 @@ class FujiCamera(
         return PropDesc(code, type, writable = writable, current = value, synthetic = true)
     }
 
-    private var changeLogBudget = 40
+    private var changeLogBudget = 2
 
     private val readOnlyGuess = setOf(FujiProp.BATTERY, 0x5001, FujiProp.SHOTS_REMAINING, FujiProp.MOVIE_REMAINING)
 
@@ -228,6 +229,70 @@ class FujiCamera(
     }
 
     fun reconnectLiveView() = liveView?.reconnect()
+
+    private var openCaptureTid = 0L
+
+    /** Closes the open capture session (the camera keeps live view off until it is reopened). */
+    fun terminateCapture() {
+        try {
+            val r = client.transaction(PtpOp.TERMINATE_OPEN_CAPTURE, listOf(openCaptureTid), timeoutMs = 5000)
+            log.log("TerminateOpenCapture(#$openCaptureTid): ${PtpResp.name(r.code)}")
+        } catch (e: java.net.SocketTimeoutException) {
+            log.log("TerminateOpenCapture got no reply")
+        }
+    }
+
+    /** Full live view restart: close the capture session, reopen it, reconnect the stream. */
+    fun restartLiveView() {
+        terminateCapture()
+        startRemote()
+        reconnectLiveView()
+    }
+
+    private fun jpegStart(d: ByteArray?): Int {
+        if (d == null || d.size < 4) return -1
+        for (i in 0 until minOf(d.size - 1, 1024)) if (d[i] == 0xFF.toByte() && d[i + 1] == 0xD8.toByte()) return i
+        return -1
+    }
+
+    private fun tryJpeg(label: String, r: PtpResponse): ByteArray? {
+        val d = r.data
+        val at = jpegStart(d)
+        log.log("  $label: ${PtpResp.name(r.code)}, ${d?.size ?: 0} bytes${if (at >= 0) ", JPEG at $at" else ""}")
+        return if (r.ok && d != null && at >= 0) d.copyOfRange(at, d.size) else null
+    }
+
+    /**
+     * After a shot the X-T3 announces (handle, size) but rejects GetObjectInfo on it in remote mode.
+     * Tries the plausible ways to get the image, in order, logging each, and returns the first JPEG.
+     * Returns (file name or null, bytes, method).
+     */
+    fun fetchShot(handle: Long, size: Long): Triple<String?, ByteArray, String>? {
+        log.log("Fetching shot ${hexL(handle)} (${size} bytes announced)")
+        fun t(op: Int, p: List<Long>, ms: Int = 15000) = try { client.transaction(op, p, timeoutMs = ms) }
+            catch (e: java.net.SocketTimeoutException) { log.log("  ${hex16(op)} timed out"); null }
+
+        t(PtpOp.GET_OBJECT, listOf(handle))?.let { r -> tryJpeg("GetObject", r)?.let { return Triple(null, it, "GetObject") } }
+        if (size > 0) t(PtpOp.GET_PARTIAL_OBJECT, listOf(handle, 0, size))?.let { r ->
+            tryJpeg("GetPartialObject", r)?.let { return Triple(null, it, "GetPartialObject") }
+        }
+        t(PtpOp.GET_THUMB, listOf(handle))?.let { r -> tryJpeg("GetThumb", r)?.let { return Triple(null, it, "GetThumb") } }
+
+        // Storage access may only open up once the capture session is closed.
+        terminateCapture()
+        t(PtpOp.GET_OBJECT_INFO, listOf(handle), 5000)?.let { r -> log.log("  GetObjectInfo after terminate: ${PtpResp.name(r.code)}") }
+        val hs = t(PtpOp.GET_OBJECT_HANDLES, listOf(0xFFFFFFFFL, 0, 0), 15000)
+        val handles = hs?.data?.takeIf { hs.ok && it.size >= 4 }?.let { d -> val n = d.u32(0).toInt(); (0 until minOf(n, (d.size - 4) / 4)).map { d.u32(4 + it * 4) } } ?: emptyList()
+        log.log("  GetObjectHandles: ${hs?.let { PtpResp.name(it.code) }}, ${handles.size} objects, last ${handles.takeLast(3).joinToString { hexL(it) }}")
+        for (h in listOfNotNull(handle.takeIf { it in handles }, handles.lastOrNull()).distinct()) {
+            val info = objectInfo(h) ?: continue
+            log.log("  object ${hexL(h)}: ${info.filename} ${info.size} bytes format ${hex16(info.format)}")
+            if (!info.isJpeg) continue
+            val bytes = download(info) {}
+            if (bytes != null && jpegStart(bytes) == 0) return Triple(info.filename, bytes, "GetObjectHandles+download")
+        }
+        return null
+    }
 
     /** Codes the camera listed as remotely controllable (empty if it sent no list). */
     val controllable: Set<Int> get() = if (fromCapabilities) capCodes else emptySet()

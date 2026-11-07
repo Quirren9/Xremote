@@ -127,7 +127,7 @@ def handle_control(s):
 def run(code, params, data):
     p0 = params[0] if params else 0
     with lock:
-        if code in (0x1002, 0x1003, 0x101C): return OK, None
+        if code in (0x1002, 0x1003, 0x101C, 0x1018): return OK, None
         if code == 0x902B:  # like the real X-T3: u32 count, then (u32 len incl. itself + DevicePropDesc) per prop
             listed = [p for c, p in PROPS.items() if c not in (0xD242, 0xD229, 0xD17C)]
             return OK, struct.pack("<I", len(listed)) + b"".join(struct.pack("<I", 4 + len(p.desc())) + p.desc() for p in listed)
@@ -156,8 +156,10 @@ def run(code, params, data):
             h = 0x220 + 6 * len(PHOTOS); PHOTOS[h] = (f"DSCF{1000 + len(PHOTOS):04d}.JPG", make_photo())
             threading.Timer(0.5, lambda: (send_event(0xC004, h - 6, h - 6), send_event(0xC001, h, h, 0x64a8))).start()
             print(f"[ctl] *click* -> handle {h:#x}"); return OK, None
-        if code == 0x1008:
-            return (OK, object_info(p0)) if p0 in PHOTOS else (0x2009, None)
+        if code == 0x1008:   # like the X-T3 in remote mode: the announced handle is rejected
+            return 0x2009, None
+        if code == 0x1009:   # assumption to test the fallback chain: GetObject on the handle works
+            return (OK, PHOTOS[p0][1]) if p0 in PHOTOS else (0x2009, None)
         if code == 0x101B:
             if p0 not in PHOTOS: return 0x2009, None
             data = PHOTOS[p0][1]; off, n = params[1], params[2]; return OK, data[off:off + n]
