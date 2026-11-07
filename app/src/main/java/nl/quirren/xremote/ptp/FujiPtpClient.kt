@@ -35,6 +35,9 @@ class FujiPtpClient(
     private var tid = 0L
     private val lock = Any()
 
+    /** Camera name from the registration reply, e.g. "X-T3". */
+    var cameraName: String? = null; private set
+
     /** Set to false to stop logging every command (e.g. during fast polling). */
     @Volatile var verbose = true
 
@@ -59,7 +62,10 @@ class FujiPtpClient(
         val type = reply.u32(0)
         log.log("< Init reply type=$type ${reply.hex(48)}")
         when (type) {
-            2L -> log.log("Registered with camera")
+            2L -> {
+                cameraName = utf16(reply, 24)
+                log.log("Registered with camera ${cameraName ?: ""}")
+            }
             5L -> {
                 val reason = if (reply.size >= 8) reply.u32(4) else 0
                 throw PtpException("Camera refused connection (${PtpResp.name(reason.toInt())}). " +
@@ -69,6 +75,14 @@ class FujiPtpClient(
         }
         s.soTimeout = 8000
         tid = 0
+    }
+
+    private fun utf16(b: ByteArray, off: Int): String? {
+        if (b.size < off + 2) return null
+        val sb = StringBuilder()
+        var i = off
+        while (i + 1 < b.size) { val c = b.u16(i); if (c == 0) break; sb.append(c.toChar()); i += 2 }
+        return sb.toString().takeIf { it.isNotBlank() }
     }
 
     /** Reads one length-prefixed packet, returns bytes after the length field. */
@@ -111,9 +125,13 @@ class FujiPtpClient(
             val rid = body.u32(4)
             val payload = body.copyOfRange(8, body.size)
             when (type) {
-                2 -> data = if (data == null) payload else data + payload
+                2 -> if (rid == id) data = if (data == null) payload else data + payload
+                    else log.log("! dropping late data for #$rid")
                 3 -> {
-                    if (rid != id) log.log("! response for #$rid while waiting for #$id")
+                    if (rid != id) {   // late answer to an earlier, timed-out command
+                        log.log("! dropping late response ${PtpResp.name(code)} for #$rid (waiting for #$id)")
+                        continue
+                    }
                     val rp = LeReader(payload).let { r -> List(payload.size / 4) { r.u32() } }
                     val resp = PtpResponse(code, rp, data)
                     if (v || !resp.ok) log.log("< ${hex16(op)} #$id $resp" + (data?.let { " ${it.hex(32)}" } ?: ""))

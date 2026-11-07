@@ -83,7 +83,7 @@ def handle_control(s):
     pkt = recv_packet(s)
     name = pkt[24:78].decode("utf-16-le", "ignore").rstrip("\x00")
     print(f"[ctl] register type={struct.unpack('<I', pkt[:4])[0]} client='{name}'")
-    s.sendall(struct.pack("<II", 68, 2) + b"\x00" * 60)
+    s.sendall(struct.pack("<II", 68, 2) + b"\x00" * 20 + "X-T3".encode("utf-16-le") + b"\x00" * 32)
     pending = {}
     while True:
         body = recv_packet(s)
@@ -98,14 +98,21 @@ def handle_control(s):
             resp, data = run(code, pending.pop(tid), payload)
         else:
             continue
+        if resp == "LATE":
+            threading.Timer(4.0, lambda t=tid: s.sendall(container(3, OK, t))).start()
+            continue
         if data is not None: s.sendall(container(2, code, tid, data))
         s.sendall(container(3, resp, tid))
 
 def run(code, params, data):
     p0 = params[0] if params else 0
     with lock:
-        if code in (0x1002, 0x1003, 0x902B, 0x9037): return OK, (b"\x00" * 8 if code == 0x902B else None)
-        if code == 0x1001: return OK, device_info()
+        if code in (0x1002, 0x1003): return OK, None
+        if code == 0x902B:  # like the real X-T3: u32 count, then (u32 len incl. itself + DevicePropDesc) per prop
+            listed = [p for c, p in PROPS.items() if c not in (0xD242, 0xD229, 0xD17C)]
+            return OK, struct.pack("<I", len(listed)) + b"".join(struct.pack("<I", 4 + len(p.desc())) + p.desc() for p in listed)
+        if code == 0x9037: return "LATE", None   # real X-T3 doesn't answer in time
+        if code == 0x1001: return OK, b""         # real X-T3 returns empty DeviceInfo over WiFi
         if code == 0x1014:
             return (OK, PROPS[p0].desc()) if p0 in PROPS else (PROP_NOT_SUPPORTED, None)
         if code == 0x1015:

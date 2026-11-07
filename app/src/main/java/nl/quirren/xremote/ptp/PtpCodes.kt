@@ -177,8 +177,9 @@ object KnownProps {
         KnownProp(0xD17C, "Focus point", "Point", PropGroup.FOCUS, 21,
             format = { v -> "${(v ushr 8) and 0xFF},${v and 0xFF}" }),
         KnownProp(0x5012, "Self-timer", "Timer", PropGroup.FOCUS, 22,
-            fallbackChoices = listOf(0L, 2000L, 10000L),
-            format = { v -> if (v == 0L) "Off" else "${v / 1000}s" }),
+            fallbackChoices = listOf(0L, 2L, 4L),
+            // X-T3 reports 0 / 2 / 4 (assumed Off / 2 s / 10 s); larger values are milliseconds
+            format = { v -> when { v == 0L -> "Off"; v == 2L -> "2s"; v == 4L -> "10s"; v >= 1000 -> "${v / 1000}s"; else -> hexL(v) } }),
         KnownProp(0x5013, "Drive mode", "Drive", PropGroup.FOCUS, 23,
             format = map(1L to "Single", 2L to "Burst", 3L to "Timelapse")),
         KnownProp(FujiProp.FOCUS_LOCK, "Focus lock", "AF-L", PropGroup.FOCUS, 24,

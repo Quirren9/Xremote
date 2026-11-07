@@ -130,7 +130,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 network = net
                 cm.bindProcessToNetwork(net)
-                val host = hostOverride.trim().ifEmpty { gatewayOf(net) ?: "192.168.0.1" }
+                val gateway = gatewayOf(net)
+                if (hostOverride.isBlank() && gateway != null && gateway != "192.168.0.1") {
+                    throw IllegalStateException("The phone is on another WiFi network ($gateway). Connect to the camera's FUJIFILM-... network, and turn off auto-reconnect for your home WiFi if Android keeps switching back.")
+                }
+                val host = hostOverride.trim().ifEmpty { gateway ?: "192.168.0.1" }
                 logger.log("Using WiFi network $net, camera host $host")
 
                 _state.value = ConnState.Working("Connecting to $host\nIf the camera asks to accept a new device, press OK on it.")
@@ -143,8 +147,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     cam.client.verbose = false
                     publish(cam)
                 }
-                cameraName.value = cam.deviceInfo?.model ?: "Camera"
+                cameraName.value = cam.deviceInfo?.model ?: cam.client.cameraName ?: "Camera"
                 cam.startStreams(onFrame = ::onFrame)
+                withContext(camIo) { delay(300); cam.startRemote() }
                 _state.value = ConnState.Connected
                 startPolling(cam)
             } catch (e: Exception) {

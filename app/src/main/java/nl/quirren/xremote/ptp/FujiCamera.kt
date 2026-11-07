@@ -46,15 +46,56 @@ class FujiCamera(
 
         try {
             val info = client.transaction(PtpOp.GET_DEVICE_INFO)
-            if (info.ok && info.data != null) {
+            if (info.ok && info.data != null && info.data.isNotEmpty()) {
                 deviceInfo = DeviceInfo.parse(info.data)
                 log.log("Device: ${deviceInfo?.manufacturer} ${deviceInfo?.model} fw ${deviceInfo?.version}, " +
                     "${deviceInfo?.properties?.size} props, ${deviceInfo?.operations?.size} ops")
             }
         } catch (e: Exception) { log.log("DeviceInfo parse failed: ${e.message}") }
 
-        client.transaction(PtpOp.FUJI_CAMERA_CAPABILITIES)
-        client.transaction(PtpOp.FUJI_START_REMOTE)
+        // Fuji's remote-mode property list: u32 count, then per entry u32 length (incl. itself) + DevicePropDesc.
+        val caps = client.transaction(PtpOp.FUJI_CAMERA_CAPABILITIES)
+        if (caps.ok && caps.data != null) parseCapabilities(caps.data)
+    }
+
+    /** Parses the 0x902B blob. Entries that fail to parse are skipped. */
+    fun parseCapabilities(data: ByteArray): Int {
+        if (data.size < 4) return 0
+        val count = data.u32(0).toInt()
+        var off = 4
+        var parsed = 0
+        for (i in 0 until count) {
+            if (off + 4 > data.size) break
+            val len = data.u32(off).toInt()
+            if (len < 8 || off + len > data.size) { log.log("Capabilities entry $i has bad length $len, stopping"); break }
+            try {
+                val d = PropDesc.parse(data.copyOfRange(off + 4, off + len))
+                if (d.code !in FujiProp.internal) { descs[d.code] = d; parsed++ }
+                log.log("  cap ${hex16(d.code)} ${KnownProps.nameOf(d.code)} = ${KnownProps.format(d.code, d.current, d.text)}" +
+                    " rw=${d.writable} options=${d.choices().size}")
+            } catch (e: Exception) {
+                log.log("  cap entry $i parse failed: ${e.message}")
+            }
+            off += len
+        }
+        log.log("Camera listed $parsed remote properties")
+        fromCapabilities = parsed > 0
+        return parsed
+    }
+
+    private var fromCapabilities = false
+
+    /**
+     * Last handshake step. On the X-T3 (remote version 2.7) the camera does not answer this
+     * until the live view socket is open, and may not answer at all, so it never fails the connection.
+     */
+    fun startRemote() {
+        try {
+            val r = client.transaction(PtpOp.FUJI_START_REMOTE, timeoutMs = 3000)
+            log.log("Start remote: ${PtpResp.name(r.code)}")
+        } catch (e: java.net.SocketTimeoutException) {
+            log.log("Start remote got no reply (continuing, a late reply is ignored)")
+        }
     }
 
     fun startStreams(onFrame: (ByteArray) -> Unit, onEvent: (Int, ByteArray) -> Unit = { _, _ -> }) {
@@ -66,8 +107,13 @@ class FujiCamera(
     fun discover(): Map<Int, PropDesc> {
         val codes = LinkedHashSet<Int>()
         deviceInfo?.properties?.let { codes.addAll(it) }
-        codes.addAll(KnownProps.all.keys)
+        if (fromCapabilities) {
+            // The camera already described its remote controls; only add status values it didn't list.
+            codes.addAll(listOf(FujiProp.BATTERY, FujiProp.SHOTS_REMAINING, FujiProp.MOVIE_REMAINING, FujiProp.FOCUS_POINT))
+            descUnsupported = true
+        } else codes.addAll(KnownProps.all.keys)
         codes.removeAll(FujiProp.internal)
+        codes.removeAll(descs.keys)
         for (code in codes) {
             val d = describe(code) ?: continue
             descs[code] = d
