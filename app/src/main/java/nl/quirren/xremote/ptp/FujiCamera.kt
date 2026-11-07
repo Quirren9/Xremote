@@ -97,13 +97,16 @@ class FujiCamera(
      * Last handshake step: InitiateOpenCapture(0, 0) puts the camera into remote live view, after which
      * it accepts connections on the event (55741) and live view (55742) ports. Never fails the connection.
      */
-    fun startRemote() {
-        try {
-            val r = client.transaction(PtpOp.INITIATE_OPEN_CAPTURE, listOf(0, 0), timeoutMs = 5000)
+    /** Returns true if the camera answered. */
+    fun startRemote(): Boolean {
+        return try {
+            val r = client.transaction(PtpOp.INITIATE_OPEN_CAPTURE, listOf(0, 0), timeoutMs = 12000)
             openCaptureTid = client.lastTid
             log.log("InitiateOpenCapture: ${PtpResp.name(r.code)} (session #$openCaptureTid)")
+            r.ok
         } catch (e: java.net.SocketTimeoutException) {
-            log.log("InitiateOpenCapture got no reply (continuing, a late reply is ignored)")
+            log.log("InitiateOpenCapture got no reply (a late reply is ignored)")
+            false
         }
     }
 

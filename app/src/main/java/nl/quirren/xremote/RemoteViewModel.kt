@@ -164,7 +164,17 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     publish(cam)
                 }
                 cameraName.value = cam.deviceInfo?.model ?: cam.client.cameraName ?: "Camera"
-                withContext(camIo) { cam.startRemote() }
+                withContext(camIo) {
+                    if (!cam.startRemote()) {
+                        // Usually a session left open by an app that was killed (e.g. reinstalled) mid-session
+                        logger.log("Camera didn't start live view, running the full live view setup once")
+                        _state.value = ConnState.Working("Waking up the camera's live view")
+                        cam.client.verbose = true
+                        cam.endLiveView()
+                        cam.enterLiveView()
+                        cam.client.verbose = false
+                    }
+                }
                 cam.startStreams(onFrame = ::onFrame, onEvent = ::onCameraEvent)
                 _state.value = ConnState.Connected
                 startPolling(cam)
