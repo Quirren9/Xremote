@@ -47,7 +47,10 @@ class MainActivity : ComponentActivity() {
                 }
 
                 if (state == ConnState.Connected) RemoteScreen(vm, onShowLog = { showLog = true })
-                else ConnectScreen(state, onConnect = vm::connect, onShowLog = { showLog = true })
+                else {
+                    val mode by vm.mode.collectAsStateWithLifecycle()
+                    ConnectScreen(state, mode, onConnect = { h, m -> vm.connect(h, m) }, onShowLog = { showLog = true })
+                }
 
                 if (showLog) LogDialog(vm, onDismiss = { showLog = false })
             }

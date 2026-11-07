@@ -76,7 +76,7 @@ data class DeviceInfo(
     }
 }
 
-data class ObjectInfo(val handle: Long, val format: Int, val size: Long, val filename: String) {
+data class ObjectInfo(val handle: Long, val format: Int, val size: Long, val filename: String, val width: Long = 0, val height: Long = 0) {
     val isJpeg get() = format == 0x3801 || filename.endsWith(".JPG", true) || filename.endsWith(".JPEG", true)
 
     companion object {
@@ -87,10 +87,10 @@ data class ObjectInfo(val handle: Long, val format: Int, val size: Long, val fil
             r.u16()                 // protection
             val size = r.u32()
             r.u16(); r.u32(); r.u32(); r.u32()   // thumb format, size, w, h
-            r.u32(); r.u32(); r.u32()            // image w, h, bit depth
+            val w = r.u32(); val h = r.u32(); r.u32()   // image w, h, bit depth
             r.u32(); r.u16(); r.u32(); r.u32()   // parent, association type/desc, sequence
             val name = r.ptpString()
-            return ObjectInfo(handle, fmt, size, name)
+            return ObjectInfo(handle, fmt, size, name, w, h)
         }
     }
 }

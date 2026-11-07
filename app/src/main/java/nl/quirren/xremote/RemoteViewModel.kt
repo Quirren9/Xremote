@@ -3,6 +3,7 @@ package nl.quirren.xremote
 import android.app.Application
 import android.content.ContentValues
 import android.provider.MediaStore
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.Network
@@ -46,6 +47,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.math.roundToInt
 
+enum class Mode(val label: String) {
+    /** Only the settings grid; framing and shutter stay on the camera. No live view or capture session. */
+    SETTINGS("Settings"),
+    /** Settings plus a big remote shutter, no live view decoding. */
+    SHUTTER("Remote shutter"),
+    /** Everything: live view, histogram, tap to focus, shutter. */
+    LIVE("Live view"),
+}
+
 sealed interface ConnState {
     data object Idle : ConnState
     data class Working(val message: String) : ConnState
@@ -88,6 +98,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private val _toast = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val toast = _toast.asSharedFlow()
     val cameraName = MutableStateFlow("")
+    val mode = MutableStateFlow(Mode.LIVE)
+    private var lastHost = ""
+    private val _histogram = MutableStateFlow<FloatArray?>(null)
+    /** 64-bin luminance histogram of the live view, normalised to the tallest bin. */
+    val histogram = _histogram.asStateFlow()
     /** Save every JPEG the camera takes to Pictures/X Remote. */
     val autoSave = MutableStateFlow(true)
     private val _lastShot = MutableStateFlow<ImageBitmap?>(null)
@@ -134,8 +149,21 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun logText(): String = synchronized(logBuf) { logBuf.joinToString("\n") }
 
     // ---- connection ----
-    fun connect(hostOverride: String) {
+    /** Switching mode reconnects, so the camera gets exactly the session that mode needs. */
+    fun switchMode(m: Mode) {
+        if (m == mode.value) return
+        logger.log("Switching to ${m.label} mode")
+        viewModelScope.launch {
+            teardown()
+            _state.value = ConnState.Idle
+            connect(lastHost, m)
+        }
+    }
+
+    fun connect(hostOverride: String, newMode: Mode = mode.value) {
         if (_state.value is ConnState.Working || _state.value == ConnState.Connected) return
+        mode.value = newMode
+        lastHost = hostOverride
         viewModelScope.launch {
             try {
                 _state.value = ConnState.Working("Looking for the camera's WiFi network")
@@ -164,7 +192,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     publish(cam)
                 }
                 cameraName.value = cam.deviceInfo?.model ?: cam.client.cameraName ?: "Camera"
-                withContext(camIo) {
+                if (newMode != Mode.SETTINGS) withContext(camIo) {
                     if (!cam.startRemote()) {
                         // Usually a session left open by an app that was killed (e.g. reinstalled) mid-session
                         logger.log("Camera didn't start live view, running the full live view setup once")
@@ -175,10 +203,12 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                         cam.client.verbose = false
                     }
                 }
-                cam.startStreams(onFrame = ::onFrame, onEvent = ::onCameraEvent)
+                // Remote shutter mode still opens the live view socket (the camera expects it) but skips decoding
+                if (newMode != Mode.SETTINGS) cam.startStreams(onFrame = ::onFrame, onEvent = ::onCameraEvent)
                 _state.value = ConnState.Connected
+                logger.log("Mode: ${newMode.label}")
                 startPolling(cam)
-                startWatchdog(cam)
+                if (newMode == Mode.LIVE) startWatchdog(cam)
             } catch (e: Exception) {
                 logger.log("Connect failed: ${e.javaClass.simpleName}: ${e.message}")
                 teardown()
@@ -281,9 +311,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun afterShot(cam: FujiCamera) {
-        transfer.value = "Preview"
-        cam.client.verbose = true
+        transfer.value = if (autoSave.value) "Preview" else null
+        cam.client.verbose = autoSave.value
+        var switched = false
         try {
+            if (!autoSave.value) transfer.value = null   // never block the shutter for a preview
             withContext(camIo) {
                 cam.capturePreview()?.let { jpeg ->
                     BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.let { _lastShot.value = it.asImageBitmap() }
@@ -291,6 +323,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             }
             if (autoSave.value) {
                 transfer.value = "Saving"
+                switched = true
                 val shot = withContext(camIo) {
                     cam.enterGallery()
                     cam.fetchNewestJpeg { f -> transfer.value = "Saving ${(f * 100).toInt()}%" }
@@ -304,11 +337,15 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     logger.log("Saved $name (${bytes.size / 1024} KB, $method) to Pictures/X Remote")
                     _toast.tryEmit("Saved $name")
                 }
+                transfer.value = "Back to live view"
+                runCatching { withContext(camIo) { cam.enterLiveView() } }.onFailure { logger.log("Back to live view failed: ${it.message}") }
             }
+            // Without a download the camera resumes live view by itself after the preview;
+            // the watchdog switches back explicitly only if frames don't return.
         } finally {
             transfer.value = null
-            runCatching { withContext(camIo) { cam.enterLiveView() } }.onFailure { logger.log("Back to live view failed: ${it.message}") }
             cam.client.verbose = false
+            if (switched) logger.log("Ready for the next shot")
         }
     }
 
@@ -353,10 +390,12 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private fun onFrame(jpeg: ByteArray) {
         if (framesSeen++ == 0L) logger.log("First live view frame (${jpeg.size} bytes)")
         lastFrameNs = System.nanoTime()
+        if (mode.value != Mode.LIVE) return
         if (!decoding.compareAndSet(false, true)) return // drop frames while busy
         try {
             val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return
             _frame.value = bmp.asImageBitmap()
+            if (framesSeen % 3 == 0L) _histogram.value = luminanceHistogram(bmp)
             val now = System.nanoTime()
             if (fpsStart == 0L) fpsStart = now
             fpsCount++
@@ -365,6 +404,21 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 fpsCount = 0; fpsStart = now
             }
         } finally { decoding.set(false) }
+    }
+
+    private fun luminanceHistogram(b: Bitmap): FloatArray {
+        val w = 96; val h = 64
+        val small = Bitmap.createScaledBitmap(b, w, h, true)
+        val px = IntArray(w * h)
+        small.getPixels(px, 0, w, 0, 0, w, h)
+        val bins = FloatArray(64)
+        for (p in px) {
+            val y = (0.299f * ((p shr 16) and 0xFF) + 0.587f * ((p shr 8) and 0xFF) + 0.114f * (p and 0xFF)).toInt()
+            bins[(y * 64 / 256).coerceIn(0, 63)]++
+        }
+        val max = bins.max().coerceAtLeast(1f)
+        for (i in bins.indices) bins[i] /= max
+        return bins
     }
 
     // ---- controls ----
@@ -394,7 +448,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun shutter() {
         val cam = camera ?: return
         if (_busy.value) return
-        if (transfer.value != null) { _toast.tryEmit("Wait a moment, the last photo is still being copied"); return }
+        if (transfer.value != null) { _toast.tryEmit("Wait a moment: ${transfer.value}"); return }
         _busy.value = true
         viewModelScope.launch {
             logger.log("Shutter")
@@ -447,6 +501,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         _frame.value = null
         _props.value = emptyList()
         _focus.value = null
+        _histogram.value = null
         runCatching { cm.bindProcessToNetwork(null) }
         netCallback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
         netCallback = null; network = null

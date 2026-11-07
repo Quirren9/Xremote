@@ -290,7 +290,8 @@ class FujiCamera(
     fun endLiveView() {
         events()
         step("TerminateOpenCapture(#$openCaptureTid)") {
-            client.transaction(PtpOp.TERMINATE_OPEN_CAPTURE, listOf(openCaptureTid), timeoutMs = 6000)
+            // The X-T3 never answers this (seen in every log), so don't wait long; a late reply is dropped
+            client.transaction(PtpOp.TERMINATE_OPEN_CAPTURE, listOf(openCaptureTid), timeoutMs = 1500)
         }
     }
 
@@ -321,13 +322,11 @@ class FujiCamera(
         events()
         setStep("ClientState = remote mode", FujiProp.CLIENT_STATE, REMOTE_MODE, 2)
         step("get RemoteVersion") { client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(FujiProp.REMOTE_VERSION.toLong()), timeoutMs = 12000) }
-        setStep("RemoteVersion = ${hexL(LIVEVIEW_REMOTE_VERSION)}", FujiProp.REMOTE_VERSION, LIVEVIEW_REMOTE_VERSION, 4)
+        setStep("RemoteVersion = ${hexL(remoteVersion)}", FujiProp.REMOTE_VERSION, remoteVersion, 4)
         events()
         startRemote()
         events()
         inGallery = false
-        step("check ClientState") { client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(FujiProp.CLIENT_STATE.toLong()), timeoutMs = 6000)
-            .also { r -> r.data?.takeIf { it.size >= 2 }?.let { log.log("  ClientState is now ${it.u16(0)} (5 = remote shooting)") } } }
     }
 
     private fun jpegStart(d: ByteArray?): Int {
@@ -366,7 +365,7 @@ class FujiCamera(
 
     private fun fetchNewestJpegInner(n: Int, progress: (Float) -> Unit): Triple<String, ByteArray, String>? {
         val candidates = (listOf(1L, 2L) + listOf(n.toLong(), n - 1L)).filter { it in 1..n.toLong() }.distinct()
-        val infos = candidates.mapNotNull { h -> objectInfo(h)?.also { log.log("  object $h: ${it.filename} ${it.size / 1024} KB format ${hex16(it.format)}") } }
+        val infos = candidates.mapNotNull { h -> objectInfo(h)?.also { log.log("  object $h: ${it.filename} ${it.size / 1024} KB, ${it.width}x${it.height}, format ${hex16(it.format)}") } }
         val best = infos.filter { it.isJpeg }.maxByOrNull { dscfNumber(it.filename) }
             ?: run { log.log("  no JPEG among the newest objects"); return null }
         log.log("  downloading ${best.filename}")

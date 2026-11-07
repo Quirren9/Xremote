@@ -32,7 +32,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FileDownloadOff
 import androidx.compose.material.icons.filled.LinkOff
@@ -69,6 +74,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import nl.quirren.xremote.Mode
 import nl.quirren.xremote.PropUi
 import nl.quirren.xremote.RemoteViewModel
 import nl.quirren.xremote.ptp.FujiProp
@@ -87,42 +93,91 @@ fun RemoteScreen(vm: RemoteViewModel, onShowLog: () -> Unit) {
     val autoSave by vm.autoSave.collectAsStateWithLifecycle()
     val transfer by vm.transfer.collectAsStateWithLifecycle()
     val lastShot by vm.lastShot.collectAsStateWithLifecycle()
+    val mode by vm.mode.collectAsStateWithLifecycle()
+    val histogram by vm.histogram.collectAsStateWithLifecycle()
     var selected by remember { mutableStateOf<Int?>(null) }
+    val gridProps = props.filter { it.group != PropGroup.STATUS && it.code != FujiProp.FOCUS_POINT }
+    val sel = selected?.let { c -> props.find { it.code == c } }
+
+    @Composable
+    fun picker(modifier: Modifier) {
+        if (sel != null) ValuePicker(prop = sel, onPick = { vm.setProp(sel.code, it) }, onClose = { selected = null }, modifier = modifier)
+    }
 
     Row(Modifier.fillMaxSize().background(Bg).safeDrawingPadding()) {
-        ControlGrid(
-            props = props.filter { it.group != PropGroup.STATUS && it.code != FujiProp.FOCUS_POINT },
-            selected = selected,
-            onSelect = { selected = if (selected == it) null else it },
-            modifier = Modifier.width(264.dp).fillMaxHeight().background(Panel),
-        )
-        Box(Modifier.weight(1f).fillMaxHeight()) {
-            LiveView(frame, focus, onTap = vm::tapFocus, modifier = Modifier.fillMaxSize())
-            StatusBar(name, props, fps, transfer, Modifier.align(Alignment.TopCenter).padding(8.dp))
-            lastShot?.let { shot ->
-                Image(bitmap = shot, contentDescription = "Last shot", contentScale = ContentScale.Crop,
-                    modifier = Modifier.align(Alignment.TopEnd).padding(10.dp).size(width = 96.dp, height = 64.dp)
-                        .clip(RoundedCornerShape(6.dp)).border(1.dp, TextHi, RoundedCornerShape(6.dp)))
+        when (mode) {
+            Mode.SETTINGS -> Box(Modifier.weight(1f).fillMaxHeight()) {
+                ControlGrid(gridProps, selected, { selected = if (selected == it) null else it }, columns = 4,
+                    modifier = Modifier.fillMaxSize().background(Panel).padding(top = 36.dp))
+                StatusBar(name, props, null, transfer, Modifier.align(Alignment.TopCenter).padding(6.dp))
+                picker(Modifier.align(Alignment.BottomCenter).padding(10.dp).fillMaxWidth())
             }
-            val sel = selected?.let { c -> props.find { it.code == c } }
-            if (sel != null) {
-                ValuePicker(
-                    prop = sel,
-                    onPick = { vm.setProp(sel.code, it) },
-                    onClose = { selected = null },
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(10.dp).fillMaxWidth(),
-                )
+            Mode.SHUTTER, Mode.LIVE -> {
+                ControlGrid(gridProps, selected, { selected = if (selected == it) null else it }, columns = 2,
+                    modifier = Modifier.width(264.dp).fillMaxHeight().background(Panel))
+                Box(Modifier.weight(1f).fillMaxHeight()) {
+                    if (mode == Mode.LIVE) {
+                        LiveView(frame, focus, onTap = vm::tapFocus, modifier = Modifier.fillMaxSize())
+                        histogram?.let { Histogram(it, Modifier.align(Alignment.BottomStart).padding(10.dp)) }
+                    } else {
+                        BigShutter(busy, onShutter = vm::shutter, modifier = Modifier.align(Alignment.Center))
+                    }
+                    StatusBar(name, props, if (mode == Mode.LIVE) fps else null, transfer, Modifier.align(Alignment.TopCenter).padding(8.dp))
+                    lastShot?.let { shot ->
+                        Image(bitmap = shot, contentDescription = "Last shot", contentScale = ContentScale.Crop,
+                            modifier = Modifier.align(Alignment.TopEnd).padding(10.dp).size(width = 96.dp, height = 64.dp)
+                                .clip(RoundedCornerShape(6.dp)).border(1.dp, TextHi, RoundedCornerShape(6.dp)))
+                    }
+                    picker(Modifier.align(Alignment.BottomCenter).padding(10.dp).fillMaxWidth())
+                }
             }
         }
-        ShutterRail(busy, autoSave, onShutter = vm::shutter, onLog = onShowLog, onToggleSave = vm::toggleAutoSave, onDisconnect = vm::disconnect)
+        ShutterRail(
+            busy = busy, autoSave = autoSave, mode = mode, showShutter = mode == Mode.LIVE,
+            onShutter = vm::shutter, onLog = onShowLog, onToggleSave = vm::toggleAutoSave,
+            onMode = vm::switchMode, onDisconnect = vm::disconnect,
+        )
+    }
+}
+
+/** Luminance histogram of the live view, shadows left, highlights right; clipped ends turn red. */
+@Composable
+private fun Histogram(bins: FloatArray, modifier: Modifier) {
+    val clipLow = bins.first() > 0.6f
+    val clipHigh = bins.last() > 0.6f
+    Canvas(modifier.size(width = 168.dp, height = 72.dp).clip(RoundedCornerShape(8.dp)).background(Color.Black.copy(alpha = 0.55f))) {
+        val w = size.width; val h = size.height; val pad = 6.dp.toPx()
+        val path = Path().apply {
+            moveTo(pad, h - pad)
+            bins.forEachIndexed { i, v -> lineTo(pad + i * (w - 2 * pad) / (bins.size - 1), h - pad - v * (h - 2 * pad)) }
+            lineTo(w - pad, h - pad); close()
+        }
+        drawPath(path, Color.White.copy(alpha = 0.75f), style = Fill)
+        if (clipLow) drawRect(Danger, topLeft = Offset(0f, 0f), size = Size(3.dp.toPx(), h))
+        if (clipHigh) drawRect(Danger, topLeft = Offset(w - 3.dp.toPx(), 0f), size = Size(3.dp.toPx(), h))
     }
 }
 
 @Composable
-private fun ControlGrid(props: List<PropUi>, selected: Int?, onSelect: (Int) -> Unit, modifier: Modifier) {
+private fun BigShutter(busy: Boolean, onShutter: () -> Unit, modifier: Modifier) {
+    val haptic = LocalHapticFeedback.current
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            Modifier.size(168.dp).clip(CircleShape).border(6.dp, TextHi, CircleShape)
+                .clickable(enabled = !busy) { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onShutter() }
+                .padding(16.dp).clip(CircleShape).background(if (busy) TileHi else Accent),
+            contentAlignment = Alignment.Center,
+        ) { if (busy) CircularProgressIndicator(Modifier.size(44.dp), color = Accent, strokeWidth = 4.dp) }
+        Spacer(Modifier.height(14.dp))
+        Text("Remote shutter", color = TextDim, fontSize = 13.sp)
+    }
+}
+
+@Composable
+private fun ControlGrid(props: List<PropUi>, selected: Int?, onSelect: (Int) -> Unit, columns: Int, modifier: Modifier) {
     val groups = props.groupBy { it.group }.toSortedMap(compareBy { it.ordinal })
     LazyVerticalGrid(
-        columns = GridCells.Fixed(2),
+        columns = GridCells.Fixed(columns),
         modifier = modifier,
         contentPadding = PaddingValues(8.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -196,7 +251,7 @@ private fun LiveView(frame: ImageBitmap?, focus: Pair<Float, Float>?, onTap: (Fl
 }
 
 @Composable
-private fun StatusBar(name: String, props: List<PropUi>, fps: Float, transfer: String?, modifier: Modifier) {
+private fun StatusBar(name: String, props: List<PropUi>, fps: Float?, transfer: String?, modifier: Modifier) {
     val status = props.filter { it.group == PropGroup.STATUS }
     Row(
         modifier.clip(RoundedCornerShape(8.dp)).background(Color.Black.copy(alpha = 0.55f)).padding(horizontal = 10.dp, vertical = 4.dp),
@@ -205,7 +260,7 @@ private fun StatusBar(name: String, props: List<PropUi>, fps: Float, transfer: S
     ) {
         Text(name, color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         status.forEach { Text("${it.short} ${it.text}", color = TextHi, fontSize = 12.sp) }
-        Text(String.format(Locale.US, "%.0f fps", fps), color = TextDim, fontSize = 12.sp)
+        if (fps != null) Text(String.format(Locale.US, "%.0f fps", fps), color = TextDim, fontSize = 12.sp)
         if (transfer != null) Text(transfer, color = Accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
     }
 }
@@ -261,28 +316,47 @@ private fun ValuePicker(prop: PropUi, onPick: (Long) -> Unit, onClose: () -> Uni
 }
 
 @Composable
-private fun ShutterRail(busy: Boolean, autoSave: Boolean, onShutter: () -> Unit, onLog: () -> Unit, onToggleSave: () -> Unit, onDisconnect: () -> Unit) {
+private fun ShutterRail(
+    busy: Boolean, autoSave: Boolean, mode: Mode, showShutter: Boolean,
+    onShutter: () -> Unit, onLog: () -> Unit, onToggleSave: () -> Unit, onMode: (Mode) -> Unit, onDisconnect: () -> Unit,
+) {
     val haptic = LocalHapticFeedback.current
     Column(
-        Modifier.width(104.dp).fillMaxHeight().background(Panel).padding(vertical = 12.dp),
+        Modifier.width(104.dp).fillMaxHeight().background(Panel).padding(vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.SpaceBetween,
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            IconButton(onClick = onLog) { Icon(Icons.Default.Terminal, "Log", tint = TextDim) }
-            IconButton(onClick = onToggleSave) {
+            ModeButton(Icons.Default.Tune, "Settings only", mode == Mode.SETTINGS) { onMode(Mode.SETTINGS) }
+            ModeButton(Icons.Default.CameraAlt, "Remote shutter", mode == Mode.SHUTTER) { onMode(Mode.SHUTTER) }
+            ModeButton(Icons.Default.Visibility, "Live view", mode == Mode.LIVE) { onMode(Mode.LIVE) }
+        }
+        if (showShutter) {
+            Box(
+                Modifier.size(78.dp).clip(CircleShape).border(4.dp, TextHi, CircleShape)
+                    .clickable(enabled = !busy) { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onShutter() }
+                    .padding(9.dp).clip(CircleShape).background(if (busy) TileHi else Accent),
+                contentAlignment = Alignment.Center,
+            ) { if (busy) CircularProgressIndicator(Modifier.size(28.dp), color = Accent, strokeWidth = 3.dp) }
+        }
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            if (mode != Mode.SETTINGS) IconButton(onClick = onToggleSave) {
                 Icon(if (autoSave) Icons.Default.Download else Icons.Default.FileDownloadOff,
                     if (autoSave) "Saving shots to phone" else "Not saving shots", tint = if (autoSave) Accent else TextDim)
             }
+            IconButton(onClick = onLog) { Icon(Icons.Default.Terminal, "Log", tint = TextDim) }
+            IconButton(onClick = onDisconnect) { Icon(Icons.Default.LinkOff, "Disconnect", tint = Danger) }
         }
-        Box(
-            Modifier.size(78.dp).clip(CircleShape).border(4.dp, TextHi, CircleShape)
-                .clickable(enabled = !busy) { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onShutter() }
-                .padding(9.dp).clip(CircleShape).background(if (busy) TileHi else Accent),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (busy) CircularProgressIndicator(Modifier.size(28.dp), color = Accent, strokeWidth = 3.dp)
-        }
-        IconButton(onClick = onDisconnect) { Icon(Icons.Default.LinkOff, "Disconnect", tint = Danger) }
     }
+}
+
+@Composable
+private fun ModeButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, active: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier.padding(vertical = 3.dp).size(44.dp).clip(RoundedCornerShape(10.dp))
+            .background(if (active) Accent.copy(alpha = 0.18f) else Color.Transparent)
+            .then(if (active) Modifier.border(1.5.dp, Accent, RoundedCornerShape(10.dp)) else Modifier)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) { Icon(icon, label, tint = if (active) Accent else TextDim) }
 }
