@@ -86,15 +86,15 @@ class FujiCamera(
     private var fromCapabilities = false
 
     /**
-     * Last handshake step. On the X-T3 (remote version 2.7) the camera does not answer this
-     * until the live view socket is open, and may not answer at all, so it never fails the connection.
+     * Last handshake step: InitiateOpenCapture(0, 0) puts the camera into remote live view, after which
+     * it accepts connections on the event (55741) and live view (55742) ports. Never fails the connection.
      */
     fun startRemote() {
         try {
-            val r = client.transaction(PtpOp.FUJI_START_REMOTE, timeoutMs = 3000)
-            log.log("Start remote: ${PtpResp.name(r.code)}")
+            val r = client.transaction(PtpOp.INITIATE_OPEN_CAPTURE, listOf(0, 0), timeoutMs = 5000)
+            log.log("InitiateOpenCapture: ${PtpResp.name(r.code)}")
         } catch (e: java.net.SocketTimeoutException) {
-            log.log("Start remote got no reply (continuing, a late reply is ignored)")
+            log.log("InitiateOpenCapture got no reply (continuing, a late reply is ignored)")
         }
     }
 

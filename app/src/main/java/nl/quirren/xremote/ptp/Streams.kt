@@ -125,12 +125,14 @@ class EventChannel(
     fun start() {
         running = true
         Thread({
-            try {
+            var attempt = 0
+            while (running) try {
                 val s = socketFactory.createSocket()
                 s.connect(InetSocketAddress(host, port), 5000)
                 s.soTimeout = 0
                 socket = s
                 log.log("Event channel connected on :$port")
+                attempt = 0
                 val input = DataInputStream(BufferedInputStream(s.getInputStream()))
                 val lenB = ByteArray(4)
                 while (running) {
@@ -142,8 +144,14 @@ class EventChannel(
                     log.log("< async ${body.hex(32)}")
                     onEvent(code, body)
                 }
+                break
             } catch (e: Exception) {
-                if (running) log.log("Event channel closed: ${e.message}")
+                if (!running) break
+                attempt++
+                log.log("Event channel: ${e.message} (retry $attempt)")
+                try { socket?.close() } catch (_: Exception) {}
+                if (attempt > 20) { log.log("Event channel gave up"); break }
+                Thread.sleep(minOf(500L * attempt, 3000L))
             }
         }, "events").apply { isDaemon = true; start() }
     }

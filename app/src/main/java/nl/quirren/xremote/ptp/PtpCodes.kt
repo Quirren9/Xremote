@@ -15,7 +15,8 @@ object PtpOp {
 
     // Fujifilm vendor operations (from the open-source reverse-engineering projects)
     const val FUJI_CAMERA_CAPABILITIES = 0x902B
-    const val FUJI_START_REMOTE = 0x9037
+    const val FUJI_START_REMOTE = 0x9037   // no reply on the X-T3, not used
+    const val INITIATE_OPEN_CAPTURE = 0x101C   // starts remote live view; camera then opens 55741/55742
 }
 
 object PtpResp {

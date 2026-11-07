@@ -148,8 +148,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     publish(cam)
                 }
                 cameraName.value = cam.deviceInfo?.model ?: cam.client.cameraName ?: "Camera"
+                withContext(camIo) { cam.startRemote() }
                 cam.startStreams(onFrame = ::onFrame)
-                withContext(camIo) { delay(300); cam.startRemote() }
                 _state.value = ConnState.Connected
                 startPolling(cam)
             } catch (e: Exception) {

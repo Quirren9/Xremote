@@ -107,7 +107,7 @@ def handle_control(s):
 def run(code, params, data):
     p0 = params[0] if params else 0
     with lock:
-        if code in (0x1002, 0x1003): return OK, None
+        if code in (0x1002, 0x1003, 0x101C): return OK, None
         if code == 0x902B:  # like the real X-T3: u32 count, then (u32 len incl. itself + DevicePropDesc) per prop
             listed = [p for c, p in PROPS.items() if c not in (0xD242, 0xD229, 0xD17C)]
             return OK, struct.pack("<I", len(listed)) + b"".join(struct.pack("<I", 4 + len(p.desc())) + p.desc() for p in listed)
