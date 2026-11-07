@@ -184,7 +184,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun autoConnect() {
         if (autoConnectTried) return
         autoConnectTried = true
-        if (FujiUsb.findCamera(usbManager) != null) connectUsb() else connect("")
+        connect("")   // USB is parked for now, see connectUsb()
     }
 
     fun connect(hostOverride: String) {
@@ -457,8 +457,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             while (isActive) {
                 delay(1000)
                 val now = System.nanoTime()
-                val stalled = lastFrameNs != 0L && now - lastFrameNs > 4_000_000_000L
-                if (stalled && !batchRunning && !cam.inGallery && now - lastRestart > 8_000_000_000L) {
+                val stalled = lastFrameNs != 0L && now - lastFrameNs > 6_000_000_000L
+                // Never while the camera may still be busy with a shot (long exposures, noise reduction)
+                // or a setting: switching modes then is what jammed it before.
+                val quiet = now - lastActivityNs > 8_000_000_000L && !_busy.value
+                if (stalled && quiet && !batchRunning && !cam.inGallery && now - lastRestart > 8_000_000_000L) {
                     lastRestart = now
                     logger.log("Live view stalled, switching camera back to live view")
                     runCatching { withContext(camIo) { cam.enterLiveView() } }
@@ -475,6 +478,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val params = (8 until body.size - 3 step 4).map { body.u32(it) }
         logger.log("Camera event ${hex16(event)} params ${params.joinToString { hexL(it) }}")
         val cam = camera ?: return
+        lastActivityNs = System.nanoTime()
         if (cam.usb) {
             // 0x4002 = standard ObjectAdded, 0xC004 = Fuji's; either carries the new photo's handle
             if ((event == 0x4002 || event == 0xC004) && params.isNotEmpty() && seenHandles.add(params[0]))
