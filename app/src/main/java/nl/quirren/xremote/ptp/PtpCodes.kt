@@ -78,6 +78,7 @@ object FujiProp {
     const val REMOTE_VERSION = 0xDF24
     const val REMOTE_GET_OBJECT_VERSION = 0xDF25
     const val OBJECT_COUNT = 0xD222
+    const val ENABLE_CORRECT_FILE_SIZE = 0xD227
     const val CHANGED_PROPS = 0xD212     // list of (code, value) that changed since last poll
     const val SHUTTER_PRESS = 0xD208
     const val FOCUS_LOCK = 0xD209

@@ -18,6 +18,8 @@ class FujiCamera(
         const val PORT_EVENTS = 55741
         const val PORT_LIVEVIEW = 55742
         const val REMOTE_MODE = 5L
+        /** What libfuji (and Fuji's own app) set when re-entering live view. */
+        const val LIVEVIEW_REMOTE_VERSION = 0x0002000CL
     }
 
     val client = FujiPtpClient(socketFactory, log)
@@ -215,25 +217,33 @@ class FujiCamera(
         return try { ObjectInfo.parse(handle, d) } catch (e: Exception) { log.log("ObjectInfo parse: ${e.message}"); null }
     }
 
-    /** Downloads an object in 512 KB chunks (falls back to a single GetObject). */
+    /**
+     * Downloads an object in 1 MB chunks. Keeps reading while chunks come back full, because in remote
+     * mode the camera can report a wrong size (seen: every file "164 KB").
+     */
     fun download(info: ObjectInfo, progress: (Float) -> Unit): ByteArray? {
         val chunk = 1024L * 1024
-        val out = java.io.ByteArrayOutputStream(info.size.toInt().coerceAtLeast(0))
+        val out = java.io.ByteArrayOutputStream(maxOf(info.size.toInt(), 1 shl 20))
         var off = 0L
-        while (info.size > 0 && off < info.size) {
-            val n = minOf(chunk, info.size - off)
-            val r = client.transaction(PtpOp.GET_PARTIAL_OBJECT, listOf(info.handle, off, n), timeoutMs = 15000)
+        while (true) {
+            val r = client.transaction(PtpOp.GET_PARTIAL_OBJECT, listOf(info.handle, off, chunk), timeoutMs = 20000)
             val d = r.data
             if (!r.ok || d == null || d.isEmpty()) {
-                if (off == 0L) break   // partial reads not supported: try the whole object
-                log.log("Download stopped at $off/${info.size}: ${PtpResp.name(r.code)}"); return null
+                if (off == 0L) { log.log("  GetPartialObject: ${PtpResp.name(r.code)}"); break }
+                break   // end of file
             }
             out.write(d); off += d.size
-            progress(off.toFloat() / info.size)
+            if (info.size > 0) progress(minOf(1f, off.toFloat() / info.size))
+            if (d.size < chunk) break
         }
-        if (off > 0) return out.toByteArray()
-        val r = client.transaction(PtpOp.GET_OBJECT, listOf(info.handle), timeoutMs = 60000)
-        return if (r.ok) r.data else null
+        if (off == 0L) {
+            val r = client.transaction(PtpOp.GET_OBJECT, listOf(info.handle), timeoutMs = 60000)
+            return if (r.ok) r.data else null
+        }
+        val bytes = out.toByteArray()
+        val complete = bytes.size >= 2 && bytes[bytes.size - 2] == 0xFF.toByte() && bytes[bytes.size - 1] == 0xD9.toByte()
+        log.log("  downloaded ${bytes.size / 1024} KB (reported ${info.size / 1024} KB), JPEG end marker ${if (complete) "found" else "MISSING"}")
+        return bytes
     }
 
     fun reconnectLiveView() = liveView?.reconnect()
@@ -257,37 +267,64 @@ class FujiCamera(
 
     private fun events() { try { pollChanges() } catch (e: java.net.SocketTimeoutException) { log.log("  events timed out") } }
 
+    /** One mode-switch step: logged, patient, and never aborts the sequence. */
+    private fun step(label: String, block: () -> PtpResponse?) {
+        try {
+            val r = block()
+            log.log("  $label: ${r?.let { PtpResp.name(it.code) } ?: "-"}")
+        } catch (e: java.net.SocketTimeoutException) {
+            log.log("  $label: no reply (continuing)")
+        }
+    }
+
+    private fun setStep(label: String, code: Int, value: Long, size: Int) = step(label) {
+        val w = LeWriter()
+        if (size == 2) w.u16(value.toInt()) else w.u32(value)
+        client.transaction(PtpOp.SET_DEVICE_PROP_VALUE, listOf(code.toLong()), w.toByteArray(), timeoutMs = 12000)
+    }
+
+    /** libfuji's end_liveview: poll events, then close the capture session opened by InitiateOpenCapture. */
+    fun endLiveView() {
+        events()
+        step("TerminateOpenCapture(#$openCaptureTid)") {
+            client.transaction(PtpOp.TERMINATE_OPEN_CAPTURE, listOf(openCaptureTid), timeoutMs = 6000)
+        }
+    }
+
     /**
-     * Remote image view ("gallery") mode, as the official app and libfuji do it. Only in this state does the
-     * camera allow object access; photos are then numbered 1..N (N from property 0xD222).
+     * Remote image view ("gallery") mode, following libfuji. Only in this state does the camera allow
+     * object access; photos are then numbered 1..N (N from property 0xD222).
      */
     fun enterGallery() {
         log.log("Switching camera to gallery mode")
+        endLiveView()
         events()
-        setRaw(FujiProp.CAMERA_STATE, 6, 2)          // FUJI_REMOTE_ACCESS
+        setStep("CameraState = remote access", FujiProp.CAMERA_STATE, 6, 2)
         events(); events()
-        setRaw(FujiProp.CLIENT_STATE, 11, 2)         // FUJI_MODE_REMOTE_IMG_VIEW
+        setStep("ClientState = remote image view", FujiProp.CLIENT_STATE, 11, 2)
         events()
-        val v = client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(FujiProp.REMOTE_GET_OBJECT_VERSION.toLong()))
-        log.log("  RemoteGetObjectVersion: ${v.data?.let { if (it.size >= 4) hexL(it.u32(0)) else it.hex() } ?: PtpResp.name(v.code)}")
-        setRaw(FujiProp.REMOTE_GET_OBJECT_VERSION, 5, 4)
+        step("get RemoteGetObjectVersion") { client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(FujiProp.REMOTE_GET_OBJECT_VERSION.toLong()), timeoutMs = 12000) }
+        setStep("RemoteGetObjectVersion = 5", FujiProp.REMOTE_GET_OBJECT_VERSION, 5, 4)
         events()
         inGallery = true
         log.log("  camera state $cameraState, $numObjects objects on card")
     }
 
-    /** Back to remote live view on the already open sockets; the stream resumes by itself. */
+    /** Back to remote live view on the already open sockets (libfuji's config_liveview, subsequent switch). */
     fun enterLiveView() {
         log.log("Switching camera back to live view")
-        setRaw(FujiProp.CAMERA_STATE, 6, 2)
         events()
-        setRaw(FujiProp.CLIENT_STATE, REMOTE_MODE, 2)
-        client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(FujiProp.REMOTE_VERSION.toLong()))
-        setRaw(FujiProp.REMOTE_VERSION, remoteVersion, 4)
+        setStep("CameraState = remote access", FujiProp.CAMERA_STATE, 6, 2)
+        events()
+        setStep("ClientState = remote mode", FujiProp.CLIENT_STATE, REMOTE_MODE, 2)
+        step("get RemoteVersion") { client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(FujiProp.REMOTE_VERSION.toLong()), timeoutMs = 12000) }
+        setStep("RemoteVersion = ${hexL(LIVEVIEW_REMOTE_VERSION)}", FujiProp.REMOTE_VERSION, LIVEVIEW_REMOTE_VERSION, 4)
         events()
         startRemote()
         events()
         inGallery = false
+        step("check ClientState") { client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(FujiProp.CLIENT_STATE.toLong()), timeoutMs = 6000)
+            .also { r -> r.data?.takeIf { it.size >= 2 }?.let { log.log("  ClientState is now ${it.u16(0)} (5 = remote shooting)") } } }
     }
 
     private fun jpegStart(d: ByteArray?): Int {
@@ -317,7 +354,15 @@ class FujiCamera(
     fun fetchNewestJpeg(progress: (Float) -> Unit): Triple<String, ByteArray, String>? {
         val n = numObjects
         if (n <= 0) { log.log("  camera reported no objects ($n)"); return null }
-        val candidates = (listOf(1L, 2L, 3L) + listOf(n.toLong(), n - 1L, n - 2L)).filter { it in 1..n.toLong() }.distinct()
+        setStep("EnableCorrectFileSize = 1", FujiProp.ENABLE_CORRECT_FILE_SIZE, 1, 2)
+        try { return fetchNewestJpegInner(n, progress) } finally {
+            events()
+            setStep("EnableCorrectFileSize = 0", FujiProp.ENABLE_CORRECT_FILE_SIZE, 0, 2)
+        }
+    }
+
+    private fun fetchNewestJpegInner(n: Int, progress: (Float) -> Unit): Triple<String, ByteArray, String>? {
+        val candidates = (listOf(1L, 2L) + listOf(n.toLong(), n - 1L)).filter { it in 1..n.toLong() }.distinct()
         val infos = candidates.mapNotNull { h -> objectInfo(h)?.also { log.log("  object $h: ${it.filename} ${it.size / 1024} KB format ${hex16(it.format)}") } }
         val best = infos.filter { it.isJpeg }.maxByOrNull { dscfNumber(it.filename) }
             ?: run { log.log("  no JPEG among the newest objects"); return null }

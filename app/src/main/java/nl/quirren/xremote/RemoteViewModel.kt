@@ -213,6 +213,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                         // everything else comes from the direct reads below.
                         val changes = cam.pollChanges()
                         // D212 = snapshot of (code, value) pairs, decoding confirmed on the X-T3
+                        if (cam.inGallery) return@withContext   // gallery-mode snapshots mean something else
                         for ((code, v) in changes) {
                             if (code in FujiProp.internal) continue
                             cam.descs[code]?.let { cam.descs[code] = it.copy(current = v) }
@@ -271,6 +272,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun afterShot(cam: FujiCamera) {
         transfer.value = "Preview"
+        cam.client.verbose = true
         try {
             withContext(camIo) {
                 cam.capturePreview()?.let { jpeg ->
@@ -296,6 +298,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         } finally {
             transfer.value = null
             runCatching { withContext(camIo) { cam.enterLiveView() } }.onFailure { logger.log("Back to live view failed: ${it.message}") }
+            cam.client.verbose = false
         }
     }
 
@@ -381,6 +384,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun shutter() {
         val cam = camera ?: return
         if (_busy.value) return
+        if (transfer.value != null) { _toast.tryEmit("Wait a moment, the last photo is still being copied"); return }
         _busy.value = true
         viewModelScope.launch {
             logger.log("Shutter")

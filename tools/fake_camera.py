@@ -59,18 +59,20 @@ changed = {}
 lock = threading.Lock()
 event_socks = []
 PHOTOS = {}   # handle -> (filename, jpeg bytes)
-STATE = {'client': 5}
+STATE = {'client': 5, 'correct_size': 0}
 
 def make_photo():
     try:
         from PIL import Image
-        img = Image.new("RGB", (1200, 800), (90, 140, 200)); b = io.BytesIO(); img.save(b, "JPEG", quality=85); return b.getvalue()
+        import random
+        img = Image.effect_noise((2400, 1600), 60).convert("RGB"); b = io.BytesIO(); img.save(b, "JPEG", quality=92); return b.getvalue()
     except Exception:
         return b"\xff\xd8" + b"\x00" * 200000 + b"\xff\xd9"
 
 def object_info(h):
     name, data = PHOTOS[h]
-    return (struct.pack("<IHHI", 0x10000001, 0x3801, 0, len(data)) + struct.pack("<HIII", 0x3808, 0, 0, 0)
+    size = len(data) if STATE['correct_size'] else 4000   # X-T3 reports a bogus size unless D227 = 1
+    return (struct.pack("<IHHI", 0x10000001, 0x3801, 0, size) + struct.pack("<HIII", 0x3808, 0, 0, 0)
             + struct.pack("<IIIIHII", 1200, 800, 24, 0, 0, 0, 0) + ptp_str(name) + ptp_str("") + ptp_str("") + ptp_str(""))
 
 def send_event(code, *params):
@@ -147,6 +149,7 @@ def run(code, params, data):
             return PROP_NOT_SUPPORTED, None
         if code == 0x1016:
             if p0 == 0xDF01: STATE['client'] = struct.unpack('<H', data[:2])[0]; return OK, None
+            if p0 == 0xD227: STATE['correct_size'] = struct.unpack('<H', data[:2])[0]; return OK, None
             if p0 in (0xDF00, 0xDF24, 0xDF25, 0xD208): return OK, None
             p = PROPS.get(p0)
             if not p: return PROP_NOT_SUPPORTED, None
