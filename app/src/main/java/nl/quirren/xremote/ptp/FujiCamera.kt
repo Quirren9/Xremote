@@ -9,9 +9,11 @@ import javax.net.SocketFactory
  * found for X-series bodies. Every step is logged so it can be tuned on a real X-T3.
  */
 class FujiCamera(
-    private val socketFactory: SocketFactory,
+    private val socketFactory: SocketFactory?,
     val host: String,
     private val log: PtpLog,
+    /** Given for a USB cable connection; null means WiFi (PTP/IP). */
+    usbTransport: PtpTransport? = null,
 ) {
     companion object {
         const val PORT_CONTROL = 55740
@@ -20,9 +22,14 @@ class FujiCamera(
         const val REMOTE_MODE = 5L
         /** What libfuji (and Fuji's own app) set when re-entering live view. */
         const val LIVEVIEW_REMOTE_VERSION = 0x0002000CL
+        /** Fuji PriorityMode (libgphoto2): 1 = camera, 2 = USB host controls the settings. */
+        const val PRIORITY_MODE = 0xD207
     }
 
-    val client = FujiPtpClient(socketFactory, log)
+    val client: PtpTransport = usbTransport ?: FujiPtpClient(socketFactory ?: SocketFactory.getDefault(), log)
+    /** USB tether mode: full property set, direct downloads, no gallery switching. */
+    val usb = usbTransport != null
+    private var usbLive: PolledLiveView? = null
     var deviceInfo: DeviceInfo? = null; private set
     val descs = linkedMapOf<Int, PropDesc>()
     private var liveView: LiveViewStream? = null
@@ -30,7 +37,8 @@ class FujiCamera(
     private var descUnsupported = false
 
     fun connect(clientName: String) {
-        client.connect(host, PORT_CONTROL, clientName)
+        if (usb) { connectUsb(); return }
+        (client as FujiPtpClient).connect(host, PORT_CONTROL, clientName)
 
         val open = client.transaction(PtpOp.OPEN_SESSION, listOf(1))
         if (open.code == 0x201E) {   // left over from an app that didn't disconnect cleanly
@@ -64,6 +72,37 @@ class FujiCamera(
         // Fuji's remote-mode property list: u32 count, then per entry u32 length (incl. itself) + DevicePropDesc.
         val caps = client.transaction(PtpOp.FUJI_CAMERA_CAPABILITIES)
         if (caps.ok && caps.data != null) parseCapabilities(caps.data)
+    }
+
+    /**
+     * USB tether session (camera set to PC CONNECTION MODE > USB TETHER SHOOTING). Plain PTP:
+     * DeviceInfo lists every property, and each one has a full descriptor.
+     */
+    private fun connectUsb() {
+        try {
+            val info = client.transaction(PtpOp.GET_DEVICE_INFO)
+            if (info.ok && info.data != null && info.data.isNotEmpty()) {
+                deviceInfo = DeviceInfo.parse(info.data)
+                log.log("USB device: ${deviceInfo?.manufacturer} ${deviceInfo?.model} fw ${deviceInfo?.version}, " +
+                    "${deviceInfo?.properties?.size} props, ${deviceInfo?.operations?.size} ops, ${deviceInfo?.events?.size} events")
+                log.log("  ops: ${deviceInfo?.operations?.joinToString(" ") { hex16(it) }}")
+                log.log("  props: ${deviceInfo?.properties?.joinToString(" ") { hex16(it) }}")
+            }
+        } catch (e: Exception) { log.log("DeviceInfo failed: ${e.message}") }
+        val open = client.transaction(PtpOp.OPEN_SESSION, listOf(1))
+        if (open.code == 0x201E) {
+            log.log("Old session still open, closing it first")
+            client.transaction(PtpOp.CLOSE_SESSION)
+            expectOk(client.transaction(PtpOp.OPEN_SESSION, listOf(1)), "OpenSession")
+        } else expectOk(open, "OpenSession")
+        // Priority mode (1 = camera dials and buttons, 2 = the phone). Left as it is so the camera
+        // stays fully usable; the "Control" tile switches it when a setting needs the phone in charge.
+        runCatching { client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(PRIORITY_MODE.toLong())) }
+            .getOrNull()?.data?.let { log.log("Priority mode is ${if (it.isNotEmpty()) it.u8(0) else -1} (1 = camera, 2 = phone)") }
+        if (deviceInfo?.properties?.isEmpty() != false) {
+            // Some bodies only list properties once a session is open
+            runCatching { client.transaction(PtpOp.GET_DEVICE_INFO).data?.let { if (it.isNotEmpty()) deviceInfo = DeviceInfo.parse(it) } }
+        }
     }
 
     /** Parses the 0x902B blob. Entries that fail to parse are skipped. */
@@ -110,7 +149,15 @@ class FujiCamera(
         }
     }
 
+    /** USB: live view polling and the interrupt endpoint's events. */
+    private fun startUsbStreams(onFrame: (ByteArray) -> Unit, onEvent: (Int, ByteArray) -> Unit) {
+        (client as? PtpEventSource)?.startEvents(onEvent)
+        usbLive = PolledLiveView(client, log, onStartCapture = { startRemote() }, onFrame = onFrame).also { it.start() }
+    }
+
     fun startStreams(onFrame: (ByteArray) -> Unit, onEvent: (Int, ByteArray) -> Unit = { _, _ -> }) {
+        if (usb) { startUsbStreams(onFrame, onEvent); return }
+        val socketFactory = socketFactory ?: SocketFactory.getDefault()
         events = EventChannel(socketFactory, host, PORT_EVENTS, log, onEvent).also { it.start() }
         liveView = LiveViewStream(socketFactory, host, PORT_LIVEVIEW, log, onFrame).also { it.start() }
     }
@@ -170,6 +217,7 @@ class FujiCamera(
 
     /** Fuji's change list: u16 count, then (u16 code, u32 value) entries. */
     fun pollChanges(): Map<Int, Long> {
+        if (usb) return emptyMap()   // the change list is a WiFi remote-mode feature
         val r = client.transaction(PtpOp.GET_DEVICE_PROP_VALUE, listOf(FujiProp.CHANGED_PROPS.toLong()))
         val d = r.data ?: return emptyMap()
         if (!r.ok || d.size < 2) return emptyMap()
@@ -224,8 +272,9 @@ class FujiCamera(
      * Downloads an object in 1 MB chunks. Keeps reading while chunks come back full, because in remote
      * mode the camera can report a wrong size (seen: every file "164 KB").
      */
-    fun download(info: ObjectInfo, progress: (Float) -> Unit): ByteArray? {
-        val chunk = 1024L * 1024
+    fun download(info: ObjectInfo, shouldStop: () -> Boolean = { false }, progress: (Float) -> Unit): ByteArray? {
+        // Small chunks so a shot can interrupt a download within a fraction of a second
+        val chunk = 256L * 1024
         val out = java.io.ByteArrayOutputStream(maxOf(info.size.toInt(), 1 shl 20))
         var off = 0L
         while (true) {
@@ -238,6 +287,7 @@ class FujiCamera(
             out.write(d); off += d.size
             if (info.size > 0) progress(minOf(1f, off.toFloat() / info.size))
             if (d.size < chunk) break
+            if (shouldStop()) { log.log("  download interrupted at ${off / 1024} KB"); return null }
         }
         if (off == 0L) {
             val r = client.transaction(PtpOp.GET_OBJECT, listOf(info.handle), timeoutMs = 60000)
@@ -369,7 +419,7 @@ class FujiCamera(
         val best = infos.filter { it.isJpeg }.maxByOrNull { dscfNumber(it.filename) }
             ?: run { log.log("  no JPEG among the newest objects"); return null }
         log.log("  downloading ${best.filename}")
-        val bytes = download(best, progress) ?: return null
+        val bytes = download(best, progress = progress) ?: return null
         return Triple(best.filename, bytes, "gallery object ${best.handle}")
     }
 
@@ -397,7 +447,9 @@ class FujiCamera(
                 if (info == null) { log.log("  object $h: no info"); done++; continue }
                 log.log("  object $h: ${info.filename} ${info.size / 1024} KB, ${info.width}x${info.height}")
                 if (!info.isJpeg) { done++; continue }
-                val bytes = download(info) { f -> progress(done, f) }
+                if (shouldStop()) { log.log("  saving paused, ${todo - done} left"); break }
+                val bytes = download(info, shouldStop) { f -> progress(done, f) }
+                if (bytes == null && shouldStop()) break   // interrupted: this one is redone next time
                 if (bytes != null) onFile(info.filename, bytes)
                 done++
             }
@@ -416,7 +468,7 @@ class FujiCamera(
     fun setFocusPoint(x: Int, y: Int): Boolean = setValue(FujiProp.FOCUS_POINT, ((x and 0xFF) shl 8 or (y and 0xFF)).toLong())
 
     fun close() {
-        liveView?.stop(); events?.stop()
+        liveView?.stop(); events?.stop(); usbLive?.stop(); (client as? PtpEventSource)?.stopEvents()
         try { if (client.connected) client.transaction(PtpOp.CLOSE_SESSION, timeoutMs = 2000) } catch (_: Exception) {}
         client.close()
     }

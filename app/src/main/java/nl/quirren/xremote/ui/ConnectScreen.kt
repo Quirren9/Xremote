@@ -42,10 +42,11 @@ private val steps = listOf(
     "Start wireless communication on the camera (for example by assigning Wireless Communication to an Fn button). It will show a FUJIFILM-X-T3-... network.",
     "Tap Connect (the app also tries by itself when it opens). If the phone isn't on the camera's network, Android shows a list: pick FUJIFILM-X-T3-....",
     "The first time, the camera asks you to accept the device: press OK on the camera. If the connection drops, the app reconnects by itself.",
+    "USB cable instead (all settings, camera stays usable): on the camera set SET UP > CONNECTION SETTING > PC CONNECTION MODE > USB TETHER SHOOTING AUTO, then plug in.",
 )
 
 @Composable
-fun ConnectScreen(state: ConnState, onConnect: (String) -> Unit, onStop: () -> Unit, onShowLog: () -> Unit) {
+fun ConnectScreen(state: ConnState, onConnect: (String) -> Unit, onConnectUsb: () -> Unit, onStop: () -> Unit, onShowLog: () -> Unit) {
     val ctx = LocalContext.current
     var host by rememberSaveable { mutableStateOf("") }
     val working = state is ConnState.Working
@@ -84,6 +85,10 @@ fun ConnectScreen(state: ConnState, onConnect: (String) -> Unit, onStop: () -> U
                 else Text("Connect", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
             }
             Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = onConnectUsb, enabled = !working, modifier = Modifier.fillMaxWidth()) {
+                Text("Connect over USB cable")
+            }
+            Spacer(Modifier.height(6.dp))
             OutlinedButton(
                 onClick = { ctx.startActivity(Intent(Settings.Panel.ACTION_WIFI).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) },
                 modifier = Modifier.fillMaxWidth(),

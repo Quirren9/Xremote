@@ -196,6 +196,9 @@ object KnownProps {
         KnownProp(FujiProp.FOCUS_LOCK, "Focus lock", "AF-L", PropGroup.FOCUS, 24,
             format = map(0L to "Off", 1L to "On")),
 
+        KnownProp(0xD207, "Who controls settings (USB)", "Control", PropGroup.OTHER, 40,
+            fallbackChoices = listOf(1L, 2L), format = map(1L to "Camera", 2L to "Phone")),
+
         KnownProp(FujiProp.BATTERY, "Battery", "Batt", PropGroup.STATUS, 30, format = { "$it" }),
         KnownProp(0x5001, "Battery level", "Batt", PropGroup.STATUS, 31, format = { "$it%" }),
         KnownProp(FujiProp.SHOTS_REMAINING, "Shots remaining", "Shots", PropGroup.STATUS, 32, format = { "$it" }),
@@ -203,6 +206,6 @@ object KnownProps {
     ).associateBy { it.code }
 
     fun get(code: Int): KnownProp? = all[code]
-    fun nameOf(code: Int): String = all[code]?.name ?: "Property ${hex16(code)}"
+    fun nameOf(code: Int): String = all[code]?.name ?: PropNames.map[code] ?: "Property ${hex16(code)}"
     fun format(code: Int, v: Long, text: String? = null): String = text ?: all[code]?.format?.invoke(v) ?: hexL(v)
 }

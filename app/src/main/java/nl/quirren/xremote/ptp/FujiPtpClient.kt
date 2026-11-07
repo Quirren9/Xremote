@@ -28,7 +28,7 @@ class PtpResponse(val code: Int, val params: List<Long>, val data: ByteArray?) {
 class FujiPtpClient(
     private val socketFactory: SocketFactory = SocketFactory.getDefault(),
     private val log: PtpLog,
-) {
+) : PtpTransport {
     private var socket: Socket? = null
     private lateinit var input: DataInputStream
     private lateinit var output: OutputStream
@@ -36,15 +36,15 @@ class FujiPtpClient(
     private val lock = Any()
 
     /** Camera name from the registration reply, e.g. "X-T3". */
-    var cameraName: String? = null; private set
+    override var cameraName: String? = null; private set
 
     /** Set to false to stop logging every command (e.g. during fast polling). */
-    @Volatile var verbose = true
+    @Volatile override var verbose = true
 
     /** Transaction id of the most recent command. */
-    val lastTid get() = tid
+    override val lastTid get() = tid
 
-    val connected get() = socket?.isConnected == true && socket?.isClosed == false
+    override val connected get() = socket?.isConnected == true && socket?.isClosed == false
 
     fun connect(host: String, port: Int, clientName: String, connectTimeoutMs: Int = 6000, registerTimeoutMs: Int = 45000) {
         log.log("Connecting to $host:$port")
@@ -102,11 +102,11 @@ class FujiPtpClient(
     private fun container(type: Int, code: Int, id: Long, payload: ByteArray): ByteArray =
         LeWriter().u32(12L + payload.size).u16(type).u16(code).u32(id).bytes(payload).toByteArray()
 
-    fun transaction(
+    override fun transaction(
         op: Int,
-        params: List<Long> = emptyList(),
-        dataOut: ByteArray? = null,
-        timeoutMs: Int = 8000,
+        params: List<Long>,
+        dataOut: ByteArray?,
+        timeoutMs: Int,
     ): PtpResponse = synchronized(lock) {
         val s = socket ?: throw PtpException("Not connected")
         s.soTimeout = timeoutMs
@@ -147,7 +147,7 @@ class FujiPtpClient(
         @Suppress("UNREACHABLE_CODE") error("unreachable")
     }
 
-    fun close() {
+    override fun close() {
         try { socket?.close() } catch (_: Exception) {}
         socket = null
     }

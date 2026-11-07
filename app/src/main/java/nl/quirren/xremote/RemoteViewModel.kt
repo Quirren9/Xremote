@@ -1,6 +1,17 @@
 package nl.quirren.xremote
 
 import android.app.Application
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import nl.quirren.xremote.usb.FujiUsb
 import android.content.ContentValues
 import android.provider.MediaStore
 import android.graphics.Bitmap
@@ -40,6 +51,7 @@ import nl.quirren.xremote.ptp.u16
 import nl.quirren.xremote.ptp.u32
 import nl.quirren.xremote.ptp.PropDesc
 import nl.quirren.xremote.ptp.PropForm
+import nl.quirren.xremote.ptp.PropNames
 import nl.quirren.xremote.ptp.PropGroup
 import nl.quirren.xremote.ptp.PtpLog
 import nl.quirren.xremote.ptp.PtpType
@@ -172,13 +184,15 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun autoConnect() {
         if (autoConnectTried) return
         autoConnectTried = true
-        connect("")
+        if (FujiUsb.findCamera(usbManager) != null) connectUsb() else connect("")
     }
 
     fun connect(hostOverride: String) {
         if (_state.value is ConnState.Working || _state.value == ConnState.Connected) return
         userDisconnected = false
+        usbSession = false
         lastHost = hostOverride
+        _state.value = ConnState.Working("Looking for the camera's WiFi")
         viewModelScope.launch {
             try {
                 connectOnce(hostOverride, allowPicker = true)
@@ -227,6 +241,110 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         startWatchdog(cam)
         startSaver(cam)
         updateSaveUi()
+    }
+
+    // ---- USB cable (camera in PC CONNECTION MODE > USB TETHER SHOOTING) ----
+    private val usbManager = app.getSystemService(UsbManager::class.java)
+    @Volatile private var usbSession = false
+
+    fun connectUsb(device: UsbDevice? = null) {
+        if (_state.value is ConnState.Working || _state.value == ConnState.Connected) return
+        val dev = device ?: FujiUsb.findCamera(usbManager) ?: run {
+            _state.value = ConnState.Failed("No Fujifilm camera on the USB cable. Plug it in with the camera switched on.")
+            return
+        }
+        userDisconnected = false
+        usbSession = true
+        _state.value = ConnState.Working("Connecting over USB")
+        viewModelScope.launch {
+            try {
+                if (!usbManager.hasPermission(dev)) {
+                    _state.value = ConnState.Working("Allow X Remote to use the camera in the popup")
+                    if (!requestUsbPermission(dev)) throw IllegalStateException("USB access was not allowed")
+                }
+                val t = withContext(Dispatchers.IO) { FujiUsb.open(usbManager, dev, logger) }
+                val cam = FujiCamera(null, "usb", logger, t)
+                camera = cam
+                withContext(camIo) {
+                    cam.connect("")
+                    _state.value = ConnState.Working("Reading all camera settings")
+                    cam.discover()
+                    cam.client.verbose = false
+                    publish(cam)
+                }
+                cameraName.value = cam.deviceInfo?.model ?: dev.productName ?: "Camera"
+                cam.startStreams(onFrame = ::onFrame, onEvent = ::onCameraEvent)
+                _state.value = ConnState.Connected
+                startPolling(cam)
+                logger.log("USB session ready, ${cam.descs.size} settings")
+            } catch (e: Exception) {
+                logger.log("USB connect failed: ${e.javaClass.simpleName}: ${e.message}")
+                teardown(releaseNetwork = false)
+                _state.value = ConnState.Failed(e.message ?: e.javaClass.simpleName)
+            }
+        }
+    }
+
+    /** Cable plugged in: drop a WiFi session (or a reconnect attempt) and use the cable. */
+    fun switchToUsb(dev: UsbDevice?) {
+        if (usbSession && _state.value == ConnState.Connected) return
+        userDisconnected = true
+        reconnectJob?.cancel(); reconnectJob = null
+        viewModelScope.launch {
+            if (_state.value != ConnState.Idle && _state.value !is ConnState.Failed) {
+                if (batchRunning) { yieldReq = true; withTimeoutOrNull(10_000L) { while (batchRunning) delay(50) } }
+                teardown(releaseNetwork = true)
+                _state.value = ConnState.Idle
+            }
+            connectUsb(dev)
+        }
+    }
+
+    private suspend fun requestUsbPermission(dev: UsbDevice): Boolean = suspendCancellableCoroutine { cont ->
+        val ctx = getApplication<Application>()
+        val action = "${ctx.packageName}.USB_PERMISSION"
+        val rcv = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+                runCatching { ctx.unregisterReceiver(this) }
+                if (cont.isActive) cont.resume(i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) || usbManager.hasPermission(dev))
+            }
+        }
+        ContextCompat.registerReceiver(ctx, rcv, IntentFilter(action), ContextCompat.RECEIVER_NOT_EXPORTED)
+        val pi = PendingIntent.getBroadcast(ctx, 0, Intent(action).setPackage(ctx.packageName),
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        usbManager.requestPermission(dev, pi)
+        cont.invokeOnCancellation { runCatching { ctx.unregisterReceiver(rcv) } }
+    }
+
+    /** USB: a new photo is a plain object; download it right away, live view keeps running. */
+    private suspend fun usbSaveObject(cam: FujiCamera, handle: Long) {
+        saving.value = SaveUi(waiting = 1, active = true, total = 1)
+        try {
+            withContext(camIo) {
+                val info = cam.objectInfo(handle) ?: run { logger.log("USB object ${hexL(handle)}: no info"); return@withContext }
+                logger.log("USB photo ${info.filename} ${info.size / 1024} KB, ${info.width}x${info.height}")
+                if (!info.isJpeg) { logger.log("  not a JPEG, left on the camera"); return@withContext }
+                val bytes = cam.download(info) { f -> saving.value = SaveUi(1, true, 0, 1, f) } ?: return@withContext
+                val opts = BitmapFactory.Options().apply { inSampleSize = if (info.width > 3000) 4 else 1 }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)?.let {
+                    val img = it.asImageBitmap()
+                    _lastShot.value = img
+                    reviewHoldUntilNs = System.nanoTime() + 900_000_000L
+                    _review.value = img
+                }
+                if (autoSave.value) {
+                    val fresh = synchronized(savedNames) { savedNames.add(info.filename) }
+                    if (fresh) {
+                        saveToGallery(info.filename, bytes)
+                        logger.log("Saved ${info.filename} (${bytes.size / 1024} KB) to Pictures/X Remote")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.log("USB download failed: ${e.message}")
+        } finally {
+            saving.value = null
+        }
     }
 
     /** The camera's network: the WiFi the phone is on if that's the camera, otherwise Android's picker. */
@@ -357,6 +475,12 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val params = (8 until body.size - 3 step 4).map { body.u32(it) }
         logger.log("Camera event ${hex16(event)} params ${params.joinToString { hexL(it) }}")
         val cam = camera ?: return
+        if (cam.usb) {
+            // 0x4002 = standard ObjectAdded, 0xC004 = Fuji's; either carries the new photo's handle
+            if ((event == 0x4002 || event == 0xC004) && params.isNotEmpty() && seenHandles.add(params[0]))
+                viewModelScope.launch { usbSaveObject(cam, params[0]) }
+            return
+        }
         // 0xC004 = ObjectAdded (photo written), 0xC001 = PreviewAvailable (comes ~0.5 s later)
         if (event != 0xC001 || params.isEmpty()) return
         if (!seenHandles.add(params[0])) return
@@ -469,8 +593,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             val k = KnownProps.get(d.code)
             PropUi(
                 code = d.code,
-                name = k?.name ?: "Property ${hex16(d.code)}",
-                short = k?.short ?: hex16(d.code),
+                name = k?.name ?: KnownProps.nameOf(d.code),
+                short = k?.short ?: (PropNames.map[d.code] ?: hex16(d.code)),
                 group = k?.group ?: PropGroup.OTHER,
                 order = k?.order ?: (1000 + d.code),
                 value = d.current,
@@ -633,6 +757,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private fun lost(msg: String) {
         logger.log(msg)
         if (userDisconnected || reconnectJob?.isActive == true) return
+        if (usbSession) {
+            viewModelScope.launch {
+                teardown(releaseNetwork = false)
+                _state.value = ConnState.Failed("USB connection lost. Check the cable, then tap Connect over USB.")
+            }
+            return
+        }
         reconnectJob = viewModelScope.launch {
             teardown(releaseNetwork = false)
             val start = System.nanoTime()
@@ -673,7 +804,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         if (releaseNetwork) releaseNet()
     }
 
-    private companion object { const val SAVE_IDLE_NS = 2_500_000_000L }
+    private companion object { const val SAVE_IDLE_NS = 6_000_000_000L }
 
     override fun onCleared() {
         setTorch(false)
